@@ -1,5 +1,0 @@
-[Desktop Entry]
-Name=NebulaWM
-Comment=A simple X11 window manager
-Exec=/usr/local/bin/nebulawm
-Type=Application
