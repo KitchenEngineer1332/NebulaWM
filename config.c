@@ -3,12 +3,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <pwd.h>
 
 int config_border_width = 2;
-unsigned long config_focused_color = 0xffffff;
-unsigned long config_unfocused_color = 0x555555;
+unsigned long config_focused_color = 0x7aa2f7;
+unsigned long config_unfocused_color = 0x414868;
 char config_terminal[256] = "alacritty";
 unsigned int config_modifier = Mod4Mask;
 char config_wallpaper[512] = "";
@@ -23,11 +24,34 @@ void load_config(void) {
     struct passwd *pw = getpwuid(getuid());
     if (!pw) return;
 
-    char path[512];
-    snprintf(path, sizeof(path), "%s/.config/Nebula/nebula.config", pw->pw_dir);
+    char config_dir[512];
+    snprintf(config_dir, sizeof(config_dir), "%s/.config/Nebula", pw->pw_dir);
+    
+    // Create directory if it doesn't exist
+    struct stat st = {0};
+    if (stat(config_dir, &st) == -1) {
+        mkdir(config_dir, 0755);
+    }
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/nebula.config", config_dir);
 
     FILE *f = fopen(path, "r");
-    if (!f) return;
+    if (!f) {
+        // Generate default config if it doesn't exist
+        f = fopen(path, "w");
+        if (f) {
+            fprintf(f, "border_width=2\n");
+            fprintf(f, "focused_color=#7aa2f7\n");
+            fprintf(f, "unfocused_color=#414868\n");
+            fprintf(f, "terminal=alacritty\n");
+            fprintf(f, "modifier=Mod4\n");
+            fprintf(f, "wallpaper=\n");
+            fprintf(f, "launcher=nebula-launcher\n");
+            fclose(f);
+        }
+        return;
+    }
 
     char line[256];
     while (fgets(line, sizeof(line), f)) {
