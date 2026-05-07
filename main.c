@@ -10,15 +10,117 @@
 Display *dpy;
 Window root;
 Window focused_win = 0;
+Window last_focused[9] = {0};
 int current_workspace = 0;
+int layout_modes[9] = {0};
 
 void update_workspace_hints() {
     Atom cur = XInternAtom(dpy, "_NET_CURRENT_DESKTOP", False);
     Atom num = XInternAtom(dpy, "_NET_NUMBER_OF_DESKTOPS", False);
+    Atom layout_atom = XInternAtom(dpy, "_NEBULA_CURRENT_LAYOUT", False);
     unsigned long n = 9;
     unsigned long c = current_workspace;
+    unsigned long layout = layout_modes[current_workspace];
     XChangeProperty(dpy, root, num, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&n, 1);
     XChangeProperty(dpy, root, cur, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&c, 1);
+    XChangeProperty(dpy, root, layout_atom, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&layout, 1);
+}
+
+int is_dock(Window w) {
+    Atom actual_type;
+    int actual_format;
+    unsigned long nitems, bytes_after;
+    unsigned char *prop = NULL;
+    Atom dock = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DOCK", False);
+    Atom type_atom = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
+    int dock_found = 0;
+    
+    if (XGetWindowProperty(dpy, w, type_atom, 0, 1, False, XA_ATOM,
+                           &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success && prop) {
+        if (nitems > 0 && *(Atom *)prop == dock) dock_found = 1;
+        XFree(prop);
+    }
+    return dock_found;
+}
+
+void raise_docks() {
+    unsigned int n;
+    Window root_return, parent_return, *children;
+    XQueryTree(dpy, root, &root_return, &parent_return, &children, &n);
+    for (unsigned int i = 0; i < n; i++) {
+        if (is_dock(children[i])) {
+            XRaiseWindow(dpy, children[i]);
+        }
+    }
+    if (children) XFree(children);
+}
+
+void tile_windows(int ws) {
+    if (layout_modes[ws] == 0) return;
+
+    unsigned int n;
+    Window root_return, parent_return, *children;
+    XQueryTree(dpy, root, &root_return, &parent_return, &children, &n);
+
+    int count = 0;
+    Window *ws_windows = malloc(sizeof(Window) * n);
+    for (unsigned int i = 0; i < n; i++) {
+        XWindowAttributes wa;
+        XGetWindowAttributes(dpy, children[i], &wa);
+        if (wa.override_redirect || is_dock(children[i])) continue;
+        
+        Atom actual_type;
+        int actual_format;
+        unsigned long nitems, bytes_after;
+        unsigned char *prop = NULL;
+        int win_ws = -1;
+        if (XGetWindowProperty(dpy, children[i], XInternAtom(dpy, "_NET_WM_DESKTOP", False),
+                               0, 1, False, XA_CARDINAL, &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success && prop) {
+            if (nitems > 0) win_ws = *(unsigned long *)prop;
+            XFree(prop);
+        }
+        if (win_ws == ws) {
+            ws_windows[count++] = children[i];
+        }
+    }
+
+    if (count > 0) {
+        int screen = DefaultScreen(dpy);
+        int sw = DisplayWidth(dpy, screen);
+        int sh = DisplayHeight(dpy, screen);
+        int wy = config_bar_height;
+        int wh = sh - config_bar_height;
+        int bw = config_border_width;
+
+        if (count == 1) {
+            XMoveResizeWindow(dpy, ws_windows[0], 0, wy, sw - 2*bw, wh - 2*bw);
+        } else {
+            int master_w = sw / 2;
+            XMoveResizeWindow(dpy, ws_windows[0], 0, wy, master_w - 2*bw, wh - 2*bw);
+
+            int stack_w = sw - master_w;
+            int stack_h = wh / (count - 1);
+            for (int i = 1; i < count; i++) {
+                XMoveResizeWindow(dpy, ws_windows[i], master_w, wy + (i - 1) * stack_h, stack_w - 2*bw, stack_h - 2*bw);
+            }
+        }
+    }
+    free(ws_windows);
+    if (children) XFree(children);
+}
+
+void set_focus(Window w) {
+    if (focused_win && focused_win != root) {
+        XSetWindowBorder(dpy, focused_win, config_unfocused_color);
+    }
+    if (w && w != root) {
+        XSetWindowBorder(dpy, w, config_focused_color);
+        XSetInputFocus(dpy, w, RevertToParent, CurrentTime);
+        XRaiseWindow(dpy, w);
+        raise_docks();
+        last_focused[current_workspace] = w;
+    }
+    focused_win = w;
 }
 
 void show_hide_windows() {
@@ -33,7 +135,7 @@ void show_hide_windows() {
         int ws = -1;
         if (XGetWindowProperty(dpy, children[i], XInternAtom(dpy, "_NET_WM_DESKTOP", False),
                                0, 1, False, XA_CARDINAL, &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success && prop) {
-            ws = *(unsigned long *)prop;
+            if (nitems > 0) ws = *(unsigned long *)prop;
             XFree(prop);
         }
         
@@ -43,6 +145,12 @@ void show_hide_windows() {
         }
     }
     if (children) XFree(children);
+
+    if (last_focused[current_workspace]) {
+        set_focus(last_focused[current_workspace]);
+    } else {
+        set_focus(root);
+    }
 }
 
 void grab_keys() {
@@ -65,16 +173,11 @@ void grab_buttons() {
     XGrabButton(dpy, 3, config_modifier, root, True, ButtonPressMask | ButtonReleaseMask | PointerMotionMask, GrabModeAsync, GrabModeAsync, None, None);
 }
 
-void set_focus(Window w) {
-    if (focused_win && focused_win != root) {
-        XSetWindowBorder(dpy, focused_win, config_unfocused_color);
-    }
-    if (w && w != root) {
-        XSetWindowBorder(dpy, w, config_focused_color);
-        XSetInputFocus(dpy, w, RevertToParent, CurrentTime);
-        XRaiseWindow(dpy, w);
-    }
-    focused_win = w;
+int xerror(Display *dpy, XErrorEvent *ee) {
+    (void)dpy;
+    (void)ee;
+    // Ignore X errors to prevent the WM from crashing
+    return 0;
 }
 
 int main() {
@@ -98,6 +201,8 @@ int main() {
         exit(1);
     }
 
+    XSetErrorHandler(xerror);
+
     root = DefaultRootWindow(dpy);
 
     grab_keys();
@@ -118,6 +223,16 @@ int main() {
         if (ev.type == MapRequest) {
             Window w = ev.xmaprequest.window;
             XSelectInput(dpy, w, EnterWindowMask);
+            
+            XWindowAttributes wa;
+            XGetWindowAttributes(dpy, w, &wa);
+            
+            if (!is_dock(w)) {
+                if (wa.y < config_bar_height) {
+                    XMoveWindow(dpy, w, wa.x, config_bar_height);
+                }
+            }
+
             XMapWindow(dpy, w);
             XSetWindowBorderWidth(dpy, w, config_border_width);
             
@@ -126,6 +241,7 @@ int main() {
             XChangeProperty(dpy, w, XInternAtom(dpy, "_NET_WM_DESKTOP", False), XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&ws, 1);
             
             set_focus(w);
+            tile_windows(current_workspace);
         } else if (ev.type == EnterNotify) {
             if (ev.xcrossing.window != root) {
                 set_focus(ev.xcrossing.window);
@@ -134,6 +250,12 @@ int main() {
             if (ev.xdestroywindow.window == focused_win) {
                 focused_win = 0;
             }
+            for (int i = 0; i < 9; i++) {
+                if (last_focused[i] == ev.xdestroywindow.window) {
+                    last_focused[i] = 0;
+                }
+            }
+            tile_windows(current_workspace);
         } else if (ev.type == ConfigureRequest) {
             XWindowChanges wc;
             wc.x = ev.xconfigurerequest.x;
@@ -178,6 +300,8 @@ int main() {
                         unsigned long wsv = ws;
                         XChangeProperty(dpy, focused_win, XInternAtom(dpy, "_NET_WM_DESKTOP", False), XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&wsv, 1);
                         XUnmapWindow(dpy, focused_win);
+                        tile_windows(current_workspace);
+                        tile_windows(ws);
                     }
                 } else {
                     // Switch workspace
@@ -189,6 +313,7 @@ int main() {
         } else if (ev.type == ButtonPress) {
             if (ev.xbutton.subwindow != None) {
                 XGetWindowAttributes(dpy, ev.xbutton.subwindow, &attr);
+                if (attr.override_redirect || is_dock(ev.xbutton.subwindow)) continue;
                 start = ev.xbutton;
                 set_focus(ev.xbutton.subwindow);
             }
@@ -200,6 +325,9 @@ int main() {
                 
                 int new_x = attr.x + (start.button == 1 ? xdiff : 0);
                 int new_y = attr.y + (start.button == 1 ? ydiff : 0);
+                
+                if (new_y < config_bar_height) new_y = config_bar_height;
+
                 int new_w = attr.width + (start.button == 3 ? xdiff : 0);
                 int new_h = attr.height + (start.button == 3 ? ydiff : 0);
 
@@ -210,6 +338,27 @@ int main() {
             }
         } else if (ev.type == ButtonRelease) {
             start.subwindow = None;
+        } else if (ev.type == ClientMessage) {
+            if (ev.xclient.message_type == XInternAtom(dpy, "_NET_CURRENT_DESKTOP", False)) {
+                if (ev.xclient.data.l[0] >= 0 && ev.xclient.data.l[0] < 9) {
+                    current_workspace = ev.xclient.data.l[0];
+                    update_workspace_hints();
+                    show_hide_windows();
+                }
+            } else if (ev.xclient.message_type == XInternAtom(dpy, "_NET_WM_DESKTOP", False)) {
+                int ws = ev.xclient.data.l[0];
+                if (ws >= 0 && ws < 9) {
+                    XChangeProperty(dpy, ev.xclient.window, XInternAtom(dpy, "_NET_WM_DESKTOP", False), XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&ws, 1);
+                    if (ws != current_workspace) XUnmapWindow(dpy, ev.xclient.window);
+                    else XMapWindow(dpy, ev.xclient.window);
+                    tile_windows(ws);
+                    tile_windows(current_workspace);
+                }
+            } else if (ev.xclient.message_type == XInternAtom(dpy, "_NEBULA_TOGGLE_LAYOUT", False)) {
+                layout_modes[current_workspace] ^= 1;
+                update_workspace_hints();
+                tile_windows(current_workspace);
+            }
         }
     }
 

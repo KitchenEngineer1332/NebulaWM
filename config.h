@@ -4,6 +4,7 @@
 #include <X11/Xlib.h>
 
 extern int config_border_width;
+extern int config_bar_height;
 extern unsigned long config_focused_color;
 extern unsigned long config_unfocused_color;
 extern char config_terminal[256];

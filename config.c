@@ -8,6 +8,7 @@
 #include <pwd.h>
 
 int config_border_width = 2;
+int config_bar_height = 30;
 unsigned long config_focused_color = 0x7aa2f7;
 unsigned long config_unfocused_color = 0x414868;
 char config_terminal[256] = "alacritty";
@@ -62,6 +63,8 @@ void load_config(void) {
             
             if (strcmp(key, "border_width") == 0) {
                 config_border_width = atoi(val);
+            } else if (strcmp(key, "bar_height") == 0) {
+                config_bar_height = atoi(val);
             } else if (strcmp(key, "focused_color") == 0) {
                 config_focused_color = get_color(val);
             } else if (strcmp(key, "unfocused_color") == 0) {

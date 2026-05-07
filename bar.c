@@ -23,6 +23,7 @@ typedef struct {
 
 typedef struct {
     Window win;
+    Pixmap pixmap;
     XftDraw *xft_draw;
     int x, y, width, height;
 } BarWindow;
@@ -43,11 +44,13 @@ static int num_bars = 0;
 static XftFont *font;
 static Colormap cmap;
 static Visual *visual;
+static XftColor color_bg, color_fg, color_active, color_inactive;
 
-static XftColor xft_color(const char *hex) {
-    XftColor c;
-    XftColorAllocName(dpy, visual, cmap, hex, &c);
-    return c;
+static void init_colors(void) {
+    XftColorAllocName(dpy, visual, cmap, config.bg_color, &color_bg);
+    XftColorAllocName(dpy, visual, cmap, config.fg_color, &color_fg);
+    XftColorAllocName(dpy, visual, cmap, config.active_color, &color_active);
+    XftColorAllocName(dpy, visual, cmap, config.inactive_color, &color_inactive);
 }
 
 void load_bar_config(void) {
@@ -154,9 +157,21 @@ int get_volume() {
     return vol;
 }
 
+void switch_workspace(int ws) {
+    XEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = ClientMessage;
+    ev.xclient.window = RootWindow(dpy, screen);
+    ev.xclient.message_type = XInternAtom(dpy, "_NET_CURRENT_DESKTOP", False);
+    ev.xclient.format = 32;
+    ev.xclient.data.l[0] = ws;
+    ev.xclient.data.l[1] = CurrentTime;
+    XSendEvent(dpy, RootWindow(dpy, screen), False, SubstructureRedirectMask | SubstructureNotifyMask, &ev);
+    XFlush(dpy);
+}
+
 void draw_bar(BarWindow *bar) {
-    XftColor bg = xft_color(config.bg_color);
-    XftDrawRect(bar->xft_draw, &bg, 0, 0, bar->width, config.height);
+    XftDrawRect(bar->xft_draw, &color_bg, 0, 0, bar->width, config.height);
 
     Atom actual_type;
     int actual_format;
@@ -165,22 +180,59 @@ void draw_bar(BarWindow *bar) {
     int current_ws = 0;
     if (XGetWindowProperty(dpy, RootWindow(dpy, screen), XInternAtom(dpy, "_NET_CURRENT_DESKTOP", False),
                            0, 1, False, XA_CARDINAL, &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success && prop) {
-        current_ws = *(unsigned long *)prop;
+        if (nitems > 0) current_ws = *(unsigned long *)prop;
         XFree(prop);
     }
 
-    XftColor active = xft_color(config.active_color);
-    XftColor inactive = xft_color(config.inactive_color);
-    XftColor fg = xft_color(config.fg_color);
+    int current_layout = 0;
+    unsigned char *prop_layout = NULL;
+    if (XGetWindowProperty(dpy, RootWindow(dpy, screen), XInternAtom(dpy, "_NEBULA_CURRENT_LAYOUT", False),
+                           0, 1, False, XA_CARDINAL, &actual_type, &actual_format, &nitems, &bytes_after, &prop_layout) == Success && prop_layout) {
+        if (nitems > 0) current_layout = *(unsigned long *)prop_layout;
+        XFree(prop_layout);
+    }
+
+    // Identify occupied workspaces
+    int occupied[9] = {0};
+    unsigned int n;
+    Window root_return, parent_return, *children;
+    XQueryTree(dpy, RootWindow(dpy, screen), &root_return, &parent_return, &children, &n);
+    for (unsigned int i = 0; i < n; i++) {
+        unsigned char *prop_ws = NULL;
+        if (XGetWindowProperty(dpy, children[i], XInternAtom(dpy, "_NET_WM_DESKTOP", False),
+                               0, 1, False, XA_CARDINAL, &actual_type, &actual_format, &nitems, &bytes_after, &prop_ws) == Success && prop_ws) {
+            if (nitems > 0) {
+                int ws = *(unsigned long *)prop_ws;
+                if (ws >= 0 && ws < 9) occupied[ws] = 1;
+            }
+            XFree(prop_ws);
+        }
+    }
+    if (children) XFree(children);
+
+    XftColor *active = &color_active;
+    XftColor *inactive = &color_inactive;
+    XftColor *fg = &color_fg;
 
     int x = 10;
     for (int i = 0; i < 9; i++) {
         char ws_name[2];
         snprintf(ws_name, 2, "%d", i + 1);
-        XftColor *c = (i == current_ws) ? &active : &inactive;
+        XftColor *c = (i == current_ws) ? active : (occupied[i] ? fg : inactive);
         XftDrawStringUtf8(bar->xft_draw, c, font, x, (config.height + font->ascent) / 2, (FcChar8 *)ws_name, 1);
+        
+        // Add a dot for occupied workspaces if not current
+        if (occupied[i] && i != current_ws) {
+            XftDrawRect(bar->xft_draw, fg, x + 4, (config.height + font->ascent) / 2 + 2, 4, 2);
+        }
+        
         x += 20;
     }
+
+    char *layout_str = current_layout == 0 ? "[F]" : "[T]";
+    XftColor *layout_c = current_layout == 0 ? inactive : active;
+    XftDrawStringUtf8(bar->xft_draw, layout_c, font, x, (config.height + font->ascent) / 2, (FcChar8 *)layout_str, 3);
+    x += 40;
 
     Window focused;
     int revert;
@@ -188,7 +240,7 @@ void draw_bar(BarWindow *bar) {
     if (focused != None && focused != RootWindow(dpy, screen)) {
         char *name = NULL;
         if (XFetchName(dpy, focused, &name) && name) {
-            XftDrawStringUtf8(bar->xft_draw, &fg, font, x + 20, (config.height + font->ascent) / 2, (FcChar8 *)name, strlen(name));
+            XftDrawStringUtf8(bar->xft_draw, fg, font, x + 20, (config.height + font->ascent) / 2, (FcChar8 *)name, strlen(name));
             XFree(name);
         }
     }
@@ -221,7 +273,15 @@ void draw_bar(BarWindow *bar) {
 
     XGlyphInfo extents;
     XftTextExtentsUtf8(dpy, font, (FcChar8 *)status_str, strlen(status_str), &extents);
-    XftDrawStringUtf8(bar->xft_draw, &fg, font, bar->width - extents.width - 10, (config.height + font->ascent) / 2, (FcChar8 *)status_str, strlen(status_str));
+    XftDrawStringUtf8(bar->xft_draw, fg, font, bar->width - extents.width - 10, (config.height + font->ascent) / 2, (FcChar8 *)status_str, strlen(status_str));
+
+    XCopyArea(dpy, bar->pixmap, bar->win, DefaultGC(dpy, screen), 0, 0, bar->width, bar->height, 0, 0);
+}
+
+int xerror(Display *dpy, XErrorEvent *ee) {
+    (void)dpy;
+    (void)ee;
+    return 0;
 }
 
 int main(void) {
@@ -230,9 +290,13 @@ int main(void) {
     dpy = XOpenDisplay(NULL);
     if (!dpy) return 1;
 
+    XSetErrorHandler(xerror);
+
     screen = DefaultScreen(dpy);
     visual = DefaultVisual(dpy, screen);
     cmap = DefaultColormap(dpy, screen);
+
+    init_colors();
 
     XineramaScreenInfo *info = NULL;
     int n = 0;
@@ -272,7 +336,7 @@ int main(void) {
     for (int i = 0; i < num_bars; i++) {
         XSetWindowAttributes swa;
         swa.override_redirect = True;
-        swa.event_mask = ExposureMask;
+        swa.event_mask = ExposureMask | ButtonPressMask;
         
         bars[i].win = XCreateWindow(dpy, RootWindow(dpy, screen),
                             bars[i].x, bars[i].y, bars[i].width, bars[i].height, 0,
@@ -289,12 +353,14 @@ int main(void) {
         unsigned long strut_p_vals[12] = {0, 0, config.height, 0, 0, 0, 0, 0, bars[i].x, bars[i].x + bars[i].width - 1, 0, 0};
         XChangeProperty(dpy, bars[i].win, strut_partial, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)strut_p_vals, 12);
 
-        bars[i].xft_draw = XftDrawCreate(dpy, bars[i].win, visual, cmap);
+        bars[i].pixmap = XCreatePixmap(dpy, bars[i].win, bars[i].width, bars[i].height, DefaultDepth(dpy, screen));
+        bars[i].xft_draw = XftDrawCreate(dpy, bars[i].pixmap, visual, cmap);
         XMapRaised(dpy, bars[i].win);
     }
 
     int x11_fd = ConnectionNumber(dpy);
     XEvent ev;
+    time_t last_draw = 0;
 
     while (1) {
         while (XPending(dpy)) {
@@ -303,18 +369,35 @@ int main(void) {
                 for (int i = 0; i < num_bars; i++) {
                     if (ev.xexpose.window == bars[i].win) draw_bar(&bars[i]);
                 }
+            } else if (ev.type == ButtonPress) {
+                if (ev.xbutton.x >= 10 && ev.xbutton.x < 190) {
+                    int ws = (ev.xbutton.x - 10) / 20;
+                    if (ws >= 0 && ws < 9) switch_workspace(ws);
+                } else if (ev.xbutton.x >= 190 && ev.xbutton.x < 230) {
+                    XEvent toggle_ev;
+                    memset(&toggle_ev, 0, sizeof(toggle_ev));
+                    toggle_ev.type = ClientMessage;
+                    toggle_ev.xclient.window = RootWindow(dpy, screen);
+                    toggle_ev.xclient.message_type = XInternAtom(dpy, "_NEBULA_TOGGLE_LAYOUT", False);
+                    toggle_ev.xclient.format = 32;
+                    XSendEvent(dpy, RootWindow(dpy, screen), False, SubstructureRedirectMask | SubstructureNotifyMask, &toggle_ev);
+                    XFlush(dpy);
+                }
             }
         }
 
-        for (int i = 0; i < num_bars; i++) {
-            draw_bar(&bars[i]);
-            XRaiseWindow(dpy, bars[i].win);
+        time_t now = time(NULL);
+        if (now != last_draw) {
+            for (int i = 0; i < num_bars; i++) {
+                draw_bar(&bars[i]);
+            }
+            last_draw = now;
+            XFlush(dpy);
         }
-        XFlush(dpy);
 
         struct timeval tv;
-        tv.tv_sec = 1;
-        tv.tv_usec = 0;
+        tv.tv_sec = 0;
+        tv.tv_usec = 100000; // Check every 100ms for responsiveness
 
         fd_set in_fds;
         FD_ZERO(&in_fds);
