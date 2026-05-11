@@ -21,7 +21,7 @@ XSESSIONSDIR ?= /usr/share/xsessions
 all: $(EXEC) $(LAUNCHER) $(POWERMENU) $(LOCKSCREEN) $(BAR)
 
 $(EXEC): $(OBJ)
-	$(CC) $(OBJ) $(LIBS) -o $(EXEC)
+	$(CC) $(OBJ) $(LIBS) $(XFT_LIBS) -o $(EXEC)
 
 $(LAUNCHER): launcher.c
 	$(CC) $(CFLAGS) $(XFT_CFLAGS) launcher.c $(XFT_LIBS) -o $(LAUNCHER)

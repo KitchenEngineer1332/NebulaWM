@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <ctype.h>
+#include "theme.h"
 
 /* ── Appearance ─────────────────────────────────────────────── */
 #define MAX_APPS      512
@@ -23,16 +24,6 @@
 #define PAD_Y         12
 #define FONT_NAME     "monospace:size=13"
 #define PROMPT        "Launch > "
-
-/* ── Colours (RRGGBB) ──────────────────────────────────────── */
-#define COL_BG        "#1a1b26"
-#define COL_INPUT_BG  "#24283b"
-#define COL_SEL_BG    "#414868"
-#define COL_FG        "#c0caf5"
-#define COL_PROMPT    "#7aa2f7"
-#define COL_SEL_FG    "#ffffff"
-#define COL_DIM       "#565f89"
-#define COL_BORDER    "#7aa2f7"
 
 /* ── Data types ─────────────────────────────────────────────── */
 typedef struct {
@@ -177,17 +168,18 @@ static void filter_apps(void) {
 /* ── Draw ───────────────────────────────────────────────────── */
 static void draw(void) {
     int w = WIN_W, h = WIN_H;
+    Theme t = load_theme();
 
     /* background */
-    XftColor bg = xft_color(COL_BG);
+    XftColor bg = xft_color(t.bg);
     XftDrawRect(xft_draw, &bg, 0, 0, w, h);
 
     /* input box background */
-    XftColor input_bg = xft_color(COL_INPUT_BG);
+    XftColor input_bg = xft_color(t.input_bg);
     XftDrawRect(xft_draw, &input_bg, PAD_X, PAD_Y, w - 2 * PAD_X, INPUT_H);
 
     /* prompt */
-    XftColor prompt_col = xft_color(COL_PROMPT);
+    XftColor prompt_col = xft_color(t.prompt);
     XftDrawStringUtf8(xft_draw, &prompt_col, font,
                       PAD_X + 12, PAD_Y + INPUT_H / 2 + font->ascent / 2,
                       (FcChar8 *)PROMPT, strlen(PROMPT));
@@ -197,7 +189,7 @@ static void draw(void) {
     XftTextExtentsUtf8(dpy, font, (FcChar8 *)PROMPT, strlen(PROMPT), &ext);
     int qx = PAD_X + 12 + ext.xOff + 4;
 
-    XftColor fg = xft_color(COL_FG);
+    XftColor fg = xft_color(t.fg);
     if (query_len > 0) {
         XftDrawStringUtf8(xft_draw, &fg, font,
                           qx, PAD_Y + INPUT_H / 2 + font->ascent / 2,
@@ -211,19 +203,23 @@ static void draw(void) {
     XftDrawRect(xft_draw, &fg, qx, PAD_Y + 10, 2, INPUT_H - 20);
 
     /* separator line */
-    XftColor dim = xft_color(COL_DIM);
+    XftColor dim = xft_color(t.dim);
     XftDrawRect(xft_draw, &dim, PAD_X, PAD_Y + INPUT_H + 6, w - 2 * PAD_X, 1);
 
     /* items */
     int list_y = PAD_Y + INPUT_H + 14;
     int max_visible = (h - list_y - PAD_Y) / ITEM_H;
+    if (max_visible < 0) max_visible = 0;
 
     /* adjust scroll so selected is visible */
-    if (selected < scroll_off) scroll_off = selected;
-    if (selected >= scroll_off + max_visible) scroll_off = selected - max_visible + 1;
+    if (filtered_count > 0) {
+        if (selected < scroll_off) scroll_off = selected;
+        if (max_visible > 0 && selected >= scroll_off + max_visible)
+            scroll_off = selected - max_visible + 1;
+    }
 
-    XftColor sel_bg   = xft_color(COL_SEL_BG);
-    XftColor sel_fg_c = xft_color(COL_SEL_FG);
+    XftColor sel_bg   = xft_color(t.sel_bg);
+    XftColor sel_fg_c = xft_color(t.sel_fg);
 
     for (int i = 0; i < max_visible && i + scroll_off < filtered_count; i++) {
         int idx = i + scroll_off;
@@ -245,10 +241,12 @@ static void draw(void) {
 
     /* scrollbar (if needed) */
     if (filtered_count > max_visible && max_visible > 0) {
+        int denom = filtered_count - max_visible;
         int bar_h = (max_visible * (h - list_y - PAD_Y)) / filtered_count;
         if (bar_h < 20) bar_h = 20;
-        int bar_y = list_y + (scroll_off * (h - list_y - PAD_Y - bar_h))
-                    / (filtered_count - max_visible);
+        int bar_y = list_y;
+        if (denom > 0)
+            bar_y += (scroll_off * (h - list_y - PAD_Y - bar_h)) / denom;
         XftDrawRect(xft_draw, &dim, w - PAD_X - 4, bar_y, 3, bar_h);
     }
 
@@ -260,6 +258,15 @@ static void draw(void) {
                       w - PAD_X - ext.xOff - 8,
                       PAD_Y + INPUT_H / 2 + font->ascent / 2,
                       (FcChar8 *)count, strlen(count));
+
+    /* free allocated XftColors to prevent X resource leaks */
+    XftColorFree(dpy, visual, cmap, &bg);
+    XftColorFree(dpy, visual, cmap, &input_bg);
+    XftColorFree(dpy, visual, cmap, &prompt_col);
+    XftColorFree(dpy, visual, cmap, &fg);
+    XftColorFree(dpy, visual, cmap, &dim);
+    XftColorFree(dpy, visual, cmap, &sel_bg);
+    XftColorFree(dpy, visual, cmap, &sel_fg_c);
 }
 
 /* ── Launch ─────────────────────────────────────────────────── */
@@ -298,14 +305,15 @@ int main(void) {
     swa.border_pixel = 0;
 
     unsigned long bg_pixel = 0;
+    Theme t = load_theme();
     XftColor bg_c;
-    XftColorAllocName(dpy, visual, cmap, COL_BG, &bg_c);
+    XftColorAllocName(dpy, visual, cmap, t.bg, &bg_c);
     bg_pixel = bg_c.pixel;
     swa.background_pixel = bg_pixel;
 
     win = XCreateWindow(dpy, RootWindow(dpy, screen),
                         (sw - WIN_W) / 2, (sh - WIN_H) / 2,
-                        WIN_W, WIN_H, 2,
+                        WIN_W, WIN_H, 1,
                         CopyFromParent, InputOutput, visual,
                         CWOverrideRedirect | CWEventMask
                         | CWBackPixel | CWBorderPixel,
@@ -313,7 +321,7 @@ int main(void) {
 
     /* border colour */
     XftColor border_c;
-    XftColorAllocName(dpy, visual, cmap, COL_BORDER, &border_c);
+    XftColorAllocName(dpy, visual, cmap, t.border, &border_c);
     XSetWindowBorder(dpy, win, border_c.pixel);
 
     /* Set window class hints */
@@ -333,9 +341,12 @@ int main(void) {
     xft_draw = XftDrawCreate(dpy, win, visual, cmap);
 
     XMapRaised(dpy, win);
+    XSetInputFocus(dpy, win, RevertToParent, CurrentTime);
 
     /* grab keyboard so we get all keys */
-    for (int i = 0; i < 50; i++) {
+    /* wait a bit for the WM to release its own grab if necessary */
+    usleep(50000); 
+    for (int i = 0; i < 100; i++) {
         if (XGrabKeyboard(dpy, win, True, GrabModeAsync, GrabModeAsync,
                           CurrentTime) == GrabSuccess)
             break;
@@ -394,8 +405,17 @@ int main(void) {
 
             if (redraw) draw();
         } else if (ev.type == FocusOut) {
-            /* close if we lose focus */
-            running = 0;
+            /* Only close on genuine focus loss, not spurious X11 events
+             * from grabs, popups, or pointer mode changes */
+            if (ev.xfocus.mode == NotifyNormal ||
+                ev.xfocus.mode == NotifyWhileGrabbed) {
+                /* Verify we truly lost focus by checking who has it now */
+                Window focused;
+                int revert;
+                XGetInputFocus(dpy, &focused, &revert);
+                if (focused != win)
+                    running = 0;
+            }
         }
     }
 

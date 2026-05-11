@@ -13,14 +13,12 @@
 #include <sys/types.h>
 #include <sys/select.h>
 #include <security/pam_appl.h>
+#include "theme.h"
 
 #define MAX_PASS_LEN 256
 
 char config_font[256] = "monospace:size=32";
 char config_date_font[256] = "monospace:size=16";
-char config_bg_color[32] = "#1a1b26";
-char config_text_color[32] = "#c0caf5";
-char config_indicator_color[32] = "#f7768e";
 char config_background_type[32] = "color";
 char config_background_image[512] = "";
 int config_blur_radius = 10;
@@ -65,9 +63,6 @@ static void load_config(void) {
             val[strcspn(val, "\r\n")] = 0;
             if (strcmp(key, "font") == 0) strncpy(config_font, val, sizeof(config_font) - 1);
             else if (strcmp(key, "date_font") == 0) strncpy(config_date_font, val, sizeof(config_date_font) - 1);
-            else if (strcmp(key, "bg_color") == 0) strncpy(config_bg_color, val, sizeof(config_bg_color) - 1);
-            else if (strcmp(key, "text_color") == 0) strncpy(config_text_color, val, sizeof(config_text_color) - 1);
-            else if (strcmp(key, "indicator_color") == 0) strncpy(config_indicator_color, val, sizeof(config_indicator_color) - 1);
             else if (strcmp(key, "background_type") == 0) strncpy(config_background_type, val, sizeof(config_background_type) - 1);
             else if (strcmp(key, "background_image") == 0) strncpy(config_background_image, val, sizeof(config_background_image) - 1);
             else if (strcmp(key, "blur_radius") == 0) config_blur_radius = atoi(val);
@@ -118,13 +113,14 @@ static int authenticate(void) {
 static void draw(void) {
     int sw = DisplayWidth(dpy, screen);
     int sh = DisplayHeight(dpy, screen);
+    Theme t = load_theme();
 
     if (bg_image) {
         imlib_context_set_image(bg_image);
         imlib_context_set_drawable(win);
         imlib_render_image_on_drawable(0, 0);
     } else {
-        XftColor bg = xft_color(config_bg_color);
+        XftColor bg = xft_color(t.bg);
         XftDrawRect(xft_draw, &bg, 0, 0, sw, sh);
     }
 
@@ -148,11 +144,11 @@ static void draw(void) {
     int dx = config_pos_x == -1 ? (sw - date_extents.width) / 2 : config_pos_x;
     int dy = ty + 40;
 
-    XftColor fg = xft_color(config_text_color);
+    XftColor fg = xft_color(t.fg);
     XftDrawStringUtf8(xft_draw, &fg, font, tx, ty, (FcChar8 *)time_str, strlen(time_str));
     XftDrawStringUtf8(xft_draw, &fg, date_font, dx, dy, (FcChar8 *)date_str, strlen(date_str));
 
-    XftColor ind_c = xft_color(config_indicator_color);
+    XftColor ind_c = xft_color(t.indicator);
     int ind_y = dy + 60;
     if (auth_failed == 1) {
         char *fail_msg = "Wrong password";
@@ -185,7 +181,8 @@ int main(void) {
     swa.override_redirect = True;
     swa.event_mask = ExposureMask | KeyPressMask;
     
-    XftColor bg_c = xft_color(config_bg_color);
+    Theme t = load_theme();
+    XftColor bg_c = xft_color(t.bg);
     swa.background_pixel = bg_c.pixel;
 
     win = XCreateWindow(dpy, RootWindow(dpy, screen),

@@ -1,4 +1,5 @@
 #include "config.h"
+#include "theme.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,8 +44,7 @@ void load_config(void) {
         f = fopen(path, "w");
         if (f) {
             fprintf(f, "border_width=2\n");
-            fprintf(f, "focused_color=#7aa2f7\n");
-            fprintf(f, "unfocused_color=#414868\n");
+            fprintf(f, "primary_color=#ff0055\n");
             fprintf(f, "terminal=alacritty\n");
             fprintf(f, "modifier=Mod4\n");
             fprintf(f, "wallpaper=\n");
@@ -65,10 +65,6 @@ void load_config(void) {
                 config_border_width = atoi(val);
             } else if (strcmp(key, "bar_height") == 0) {
                 config_bar_height = atoi(val);
-            } else if (strcmp(key, "focused_color") == 0) {
-                config_focused_color = get_color(val);
-            } else if (strcmp(key, "unfocused_color") == 0) {
-                config_unfocused_color = get_color(val);
             } else if (strcmp(key, "terminal") == 0) {
                 strncpy(config_terminal, val, sizeof(config_terminal) - 1);
                 config_terminal[sizeof(config_terminal) - 1] = '\0';
@@ -85,4 +81,8 @@ void load_config(void) {
         }
     }
     fclose(f);
+    
+    Theme t = load_theme();
+    config_focused_color = get_color(t.border);
+    config_unfocused_color = get_color(t.dim);
 }

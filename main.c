@@ -2,10 +2,14 @@
 #include <X11/keysym.h>
 #include <X11/XKBlib.h>
 #include <X11/Xatom.h>
+#include <X11/Xft/Xft.h>
+#include <X11/Xutil.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include "config.h"
+#include "theme.h"
 
 Display *dpy;
 Window root;
@@ -13,6 +17,241 @@ Window focused_win = 0;
 Window last_focused[9] = {0};
 int current_workspace = 0;
 int layout_modes[9] = {0};
+
+/* Focus Stack for MRU */
+Window focus_stack[1024];
+int focus_stack_count = 0;
+
+void remove_from_stack(Window w) {
+    for (int i = 0; i < focus_stack_count; i++) {
+        if (focus_stack[i] == w) {
+            for (int j = i; j < focus_stack_count - 1; j++) {
+                focus_stack[j] = focus_stack[j+1];
+            }
+            focus_stack_count--;
+            break;
+        }
+    }
+}
+
+void add_to_stack(Window w) {
+    remove_from_stack(w);
+    if (focus_stack_count < 1024) {
+        for (int i = focus_stack_count; i > 0; i--) {
+            focus_stack[i] = focus_stack[i-1];
+        }
+        focus_stack[0] = w;
+        focus_stack_count++;
+    }
+}
+
+/* Prototypes */
+void update_workspace_hints();
+int is_dock(Window w);
+void set_focus(Window w);
+void show_hide_windows();
+void tile_windows(int ws);
+
+/* Alt+Tab Switcher */
+typedef struct {
+    Window win;
+    char name[256];
+    int workspace;
+} SwitcherItem;
+
+SwitcherItem *switcher_items = NULL;
+int switcher_count = 0;
+int switcher_selected = 0;
+Window switcher_win = 0;
+int is_switching = 0;
+XftFont *switcher_font = NULL;
+XftDraw *switcher_draw = NULL;
+Colormap switcher_cmap;
+Visual *switcher_visual;
+
+void draw_switcher() {
+    if (!switcher_win) return;
+
+    int ww = 600;
+    int wh = 400;
+
+    Theme t = load_theme();
+    XftColor bg, fg, sel_bg, sel_fg, dim, border;
+    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.bg, &bg);
+    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.fg, &fg);
+    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.sel_bg, &sel_bg);
+    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.sel_fg, &sel_fg);
+    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.dim, &dim);
+    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.border, &border);
+
+    // Main background
+    XftDrawRect(switcher_draw, &bg, 0, 0, ww, wh);
+    
+    // Header
+    XftDrawRect(switcher_draw, &sel_bg, 0, 0, ww, 60);
+    char title[] = "Switch Window";
+    XftDrawStringUtf8(switcher_draw, &sel_fg, switcher_font, 20, 40, (FcChar8 *)title, strlen(title));
+
+    int item_h = 45;
+    int start_y = 80;
+    int list_w = 280;
+
+    for (int i = 0; i < switcher_count; i++) {
+        int iy = start_y + i * item_h;
+        if (i == switcher_selected) {
+            XftDrawRect(switcher_draw, &sel_bg, 10, iy - 32, list_w - 20, item_h);
+            XftDrawStringUtf8(switcher_draw, &sel_fg, switcher_font, 25, iy, (FcChar8 *)switcher_items[i].name, strlen(switcher_items[i].name));
+        } else {
+            XftDrawStringUtf8(switcher_draw, &fg, switcher_font, 25, iy, (FcChar8 *)switcher_items[i].name, strlen(switcher_items[i].name));
+        }
+        
+        char ws_info[16];
+        snprintf(ws_info, sizeof(ws_info), "WS %d", switcher_items[i].workspace + 1);
+        XftDrawStringUtf8(switcher_draw, &dim, switcher_font, list_w - 60, iy, (FcChar8 *)ws_info, strlen(ws_info));
+    }
+
+    // Preview area (right side)
+    int px = 300;
+    int py = 80;
+    int pw = ww - px - 20;
+    int ph = wh - py - 20;
+
+    XftDrawRect(switcher_draw, &dim, px, py, pw, ph);
+    XftDrawRect(switcher_draw, &bg, px + 2, py + 2, pw - 4, ph - 4);
+    
+    if (switcher_count > 0 && switcher_selected < switcher_count) {
+        char *name = switcher_items[switcher_selected].name;
+        int ws = switcher_items[switcher_selected].workspace;
+        
+        XftDrawStringUtf8(switcher_draw, &sel_bg, switcher_font, px + 20, py + 40, (FcChar8 *)"Preview", 7);
+        XftDrawRect(switcher_draw, &dim, px + 20, py + 50, pw - 40, 1);
+        
+        char truncated[64];
+        strncpy(truncated, name, 63);
+        truncated[63] = '\0';
+        XftDrawStringUtf8(switcher_draw, &fg, switcher_font, px + 20, py + 85, (FcChar8 *)truncated, strlen(truncated));
+        
+        char ws_text[32];
+        snprintf(ws_text, sizeof(ws_text), "On Workspace %d", ws + 1);
+        XftDrawStringUtf8(switcher_draw, &dim, switcher_font, px + 20, py + 120, (FcChar8 *)ws_text, strlen(ws_text));
+
+        // Window mockup
+        int mx = px + 30;
+        int my = py + 160;
+        int mw = pw - 60;
+        int mh = ph - 180;
+        XftDrawRect(switcher_draw, &dim, mx, my, mw, mh);
+        XftDrawRect(switcher_draw, &bg, mx + 1, my + 1, mw - 2, mh - 2);
+        XftDrawRect(switcher_draw, &sel_bg, mx + 1, my + 1, mw - 2, 20);
+    }
+
+    XftColorFree(dpy, switcher_visual, switcher_cmap, &bg);
+    XftColorFree(dpy, switcher_visual, switcher_cmap, &fg);
+    XftColorFree(dpy, switcher_visual, switcher_cmap, &sel_bg);
+    XftColorFree(dpy, switcher_visual, switcher_cmap, &sel_fg);
+    XftColorFree(dpy, switcher_visual, switcher_cmap, &dim);
+    XftColorFree(dpy, switcher_visual, switcher_cmap, &border);
+}
+
+void update_switcher_items() {
+    if (switcher_items) free(switcher_items);
+    switcher_items = NULL;
+    switcher_count = 0;
+
+    // Use focus stack for MRU order
+    switcher_items = malloc(sizeof(SwitcherItem) * focus_stack_count);
+    for (int i = 0; i < focus_stack_count; i++) {
+        Window w = focus_stack[i];
+        XWindowAttributes wa;
+        if (!XGetWindowAttributes(dpy, w, &wa)) continue;
+        if (wa.map_state != IsViewable) continue;
+
+        Atom actual_type;
+        int actual_format;
+        unsigned long nitems, bytes_after;
+        unsigned char *prop = NULL;
+        int ws = -1;
+        if (XGetWindowProperty(dpy, w, XInternAtom(dpy, "_NET_WM_DESKTOP", False),
+                               0, 1, False, XA_CARDINAL, &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success && prop) {
+            if (nitems > 0) ws = *(unsigned long *)prop;
+            XFree(prop);
+        }
+        
+        if (ws != -1) {
+            char *name;
+            if (XFetchName(dpy, w, &name) && name) {
+                strncpy(switcher_items[switcher_count].name, name, 255);
+                XFree(name);
+            } else {
+                strcpy(switcher_items[switcher_count].name, "Unnamed Window");
+            }
+            switcher_items[switcher_count].win = w;
+            switcher_items[switcher_count].workspace = ws;
+            switcher_count++;
+        }
+    }
+}
+
+void start_switching() {
+    update_switcher_items();
+    if (switcher_count == 0) return;
+
+    is_switching = 1;
+    switcher_selected = (switcher_count > 1) ? 1 : 0;
+
+    int sw = DisplayWidth(dpy, DefaultScreen(dpy));
+    int sh = DisplayHeight(dpy, DefaultScreen(dpy));
+    int ww = 600;
+    int wh = 400;
+
+    XSetWindowAttributes swa;
+    swa.override_redirect = True;
+    swa.background_pixel = 0;
+    swa.event_mask = ExposureMask | KeyPressMask | KeyReleaseMask;
+
+    switcher_visual = DefaultVisual(dpy, DefaultScreen(dpy));
+    switcher_cmap = DefaultColormap(dpy, DefaultScreen(dpy));
+
+    switcher_win = XCreateWindow(dpy, root, (sw - ww) / 2, (sh - wh) / 2, ww, wh, 2,
+                                 CopyFromParent, InputOutput, switcher_visual,
+                                 CWOverrideRedirect | CWBackPixel | CWEventMask, &swa);
+
+    XSetWindowBorder(dpy, switcher_win, config_focused_color);
+    
+    if (!switcher_font) {
+        switcher_font = XftFontOpenName(dpy, DefaultScreen(dpy), "monospace:size=12");
+        if (!switcher_font) switcher_font = XftFontOpenName(dpy, DefaultScreen(dpy), "fixed");
+    }
+
+    switcher_draw = XftDrawCreate(dpy, switcher_win, switcher_visual, switcher_cmap);
+    XMapRaised(dpy, switcher_win);
+    
+    XGrabKeyboard(dpy, switcher_win, True, GrabModeAsync, GrabModeAsync, CurrentTime);
+    draw_switcher();
+}
+
+void stop_switching() {
+    if (!is_switching) return;
+    is_switching = 0;
+    XUngrabKeyboard(dpy, CurrentTime);
+    
+    if (switcher_count > 0 && switcher_selected < switcher_count) {
+        Window w = switcher_items[switcher_selected].win;
+        int ws = switcher_items[switcher_selected].workspace;
+        
+        if (ws != current_workspace) {
+            current_workspace = ws;
+            update_workspace_hints();
+            show_hide_windows();
+        }
+        set_focus(w);
+    }
+
+    if (switcher_draw) XftDrawDestroy(switcher_draw);
+    XDestroyWindow(dpy, switcher_win);
+    switcher_win = 0;
+    switcher_draw = NULL;
+}
 
 void update_workspace_hints() {
     Atom cur = XInternAtom(dpy, "_NET_CURRENT_DESKTOP", False);
@@ -113,12 +352,13 @@ void set_focus(Window w) {
     if (focused_win && focused_win != root) {
         XSetWindowBorder(dpy, focused_win, config_unfocused_color);
     }
-    if (w && w != root) {
+    if (w && w != root && !is_dock(w)) {
         XSetWindowBorder(dpy, w, config_focused_color);
         XSetInputFocus(dpy, w, RevertToParent, CurrentTime);
         XRaiseWindow(dpy, w);
         raise_docks();
         last_focused[current_workspace] = w;
+        add_to_stack(w);
     }
     focused_win = w;
 }
@@ -166,6 +406,9 @@ void grab_keys() {
         XGrabKey(dpy, XKeysymToKeycode(dpy, XStringToKeysym(key)), config_modifier, root, True, GrabModeAsync, GrabModeAsync);
         XGrabKey(dpy, XKeysymToKeycode(dpy, XStringToKeysym(key)), config_modifier | ShiftMask, root, True, GrabModeAsync, GrabModeAsync);
     }
+    
+    // Alt+Tab
+    XGrabKey(dpy, XKeysymToKeycode(dpy, XStringToKeysym("Tab")), Mod1Mask, root, True, GrabModeAsync, GrabModeAsync);
 }
 
 void grab_buttons() {
@@ -209,6 +452,20 @@ int main() {
     grab_buttons();
     update_workspace_hints();
 
+    // Initialize focus stack
+    unsigned int n;
+    Window root_return, parent_return, *children;
+    if (XQueryTree(dpy, root, &root_return, &parent_return, &children, &n)) {
+        for (unsigned int i = 0; i < n; i++) {
+            XWindowAttributes wa;
+            XGetWindowAttributes(dpy, children[i], &wa);
+            if (!wa.override_redirect && !is_dock(children[i]) && wa.map_state == IsViewable) {
+                add_to_stack(children[i]);
+            }
+        }
+        if (children) XFree(children);
+    }
+
     // Start the bar
     if (fork() == 0) {
         setsid();
@@ -247,6 +504,7 @@ int main() {
                 set_focus(ev.xcrossing.window);
             }
         } else if (ev.type == DestroyNotify) {
+            remove_from_stack(ev.xdestroywindow.window);
             if (ev.xdestroywindow.window == focused_win) {
                 focused_win = 0;
             }
@@ -309,6 +567,24 @@ int main() {
                     update_workspace_hints();
                     show_hide_windows();
                 }
+            } else if (keysym == XStringToKeysym("Tab") && (ev.xkey.state & Mod1Mask)) {
+                if (!is_switching) {
+                    start_switching();
+                } else {
+                    switcher_selected = (switcher_selected + 1) % switcher_count;
+                    draw_switcher();
+                }
+            }
+        } else if (ev.type == KeyRelease) {
+            if (is_switching) {
+                KeySym keysym = XkbKeycodeToKeysym(dpy, ev.xkey.keycode, 0, 0);
+                if (keysym == XK_Alt_L || keysym == XK_Alt_R || keysym == XK_Meta_L || keysym == XK_Meta_R) {
+                    stop_switching();
+                }
+            }
+        } else if (ev.type == Expose) {
+            if (is_switching && ev.xexpose.window == switcher_win) {
+                draw_switcher();
             }
         } else if (ev.type == ButtonPress) {
             if (ev.xbutton.subwindow != None) {

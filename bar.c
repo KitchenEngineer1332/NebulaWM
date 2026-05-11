@@ -11,14 +11,11 @@
 #include <pwd.h>
 #include <sys/types.h>
 #include <sys/select.h>
+#include "theme.h"
 
 typedef struct {
     int height;
     char font[256];
-    char bg_color[32];
-    char fg_color[32];
-    char active_color[32];
-    char inactive_color[32];
 } BarConfig;
 
 typedef struct {
@@ -30,11 +27,7 @@ typedef struct {
 
 BarConfig config = {
     .height = 30,
-    .font = "monospace:size=10",
-    .bg_color = "#1a1b26",
-    .fg_color = "#c0caf5",
-    .active_color = "#7aa2f7",
-    .inactive_color = "#414868"
+    .font = "monospace:size=10"
 };
 
 static Display *dpy;
@@ -47,10 +40,11 @@ static Visual *visual;
 static XftColor color_bg, color_fg, color_active, color_inactive;
 
 static void init_colors(void) {
-    XftColorAllocName(dpy, visual, cmap, config.bg_color, &color_bg);
-    XftColorAllocName(dpy, visual, cmap, config.fg_color, &color_fg);
-    XftColorAllocName(dpy, visual, cmap, config.active_color, &color_active);
-    XftColorAllocName(dpy, visual, cmap, config.inactive_color, &color_inactive);
+    Theme t = load_theme();
+    XftColorAllocName(dpy, visual, cmap, t.bg, &color_bg);
+    XftColorAllocName(dpy, visual, cmap, t.fg, &color_fg);
+    XftColorAllocName(dpy, visual, cmap, t.active, &color_active);
+    XftColorAllocName(dpy, visual, cmap, t.inactive, &color_inactive);
 }
 
 void load_bar_config(void) {
@@ -67,10 +61,6 @@ void load_bar_config(void) {
         if (f) {
             fprintf(f, "height=30\n");
             fprintf(f, "font=monospace:size=10\n");
-            fprintf(f, "bg_color=#1a1b26\n");
-            fprintf(f, "fg_color=#c0caf5\n");
-            fprintf(f, "active_color=#7aa2f7\n");
-            fprintf(f, "inactive_color=#414868\n");
             fclose(f);
         }
         return;
@@ -84,10 +74,6 @@ void load_bar_config(void) {
             val[strcspn(val, "\r\n")] = 0;
             if (strcmp(key, "height") == 0) config.height = atoi(val);
             else if (strcmp(key, "font") == 0) strncpy(config.font, val, sizeof(config.font) - 1);
-            else if (strcmp(key, "bg_color") == 0) strncpy(config.bg_color, val, sizeof(config.bg_color) - 1);
-            else if (strcmp(key, "fg_color") == 0) strncpy(config.fg_color, val, sizeof(config.fg_color) - 1);
-            else if (strcmp(key, "active_color") == 0) strncpy(config.active_color, val, sizeof(config.active_color) - 1);
-            else if (strcmp(key, "inactive_color") == 0) strncpy(config.inactive_color, val, sizeof(config.inactive_color) - 1);
         }
     }
     fclose(f);

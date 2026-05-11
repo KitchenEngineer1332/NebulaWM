@@ -7,6 +7,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "theme.h"
+
 #define WIN_W         400
 #define WIN_H         280
 #define INPUT_H       48
@@ -15,15 +17,6 @@
 #define PAD_Y         12
 #define FONT_NAME     "monospace:size=13"
 #define PROMPT        "Power Menu"
-
-#define COL_BG        "#1a1b26"
-#define COL_INPUT_BG  "#24283b"
-#define COL_SEL_BG    "#f7768e"
-#define COL_FG        "#c0caf5"
-#define COL_PROMPT    "#f7768e"
-#define COL_SEL_FG    "#1a1b26"
-#define COL_DIM       "#565f89"
-#define COL_BORDER    "#f7768e"
 
 typedef struct {
     char name[32];
@@ -56,24 +49,26 @@ static XftColor xft_color(const char *hex) {
 
 static void draw(void) {
     int w = WIN_W, h = WIN_H;
-    XftColor bg = xft_color(COL_BG);
+    Theme t = load_theme();
+    
+    XftColor bg = xft_color(t.bg);
     XftDrawRect(xft_draw, &bg, 0, 0, w, h);
 
-    XftColor input_bg = xft_color(COL_INPUT_BG);
+    XftColor input_bg = xft_color(t.input_bg);
     XftDrawRect(xft_draw, &input_bg, PAD_X, PAD_Y, w - 2 * PAD_X, INPUT_H);
 
-    XftColor prompt_col = xft_color(COL_PROMPT);
+    XftColor prompt_col = xft_color(t.prompt);
     XftDrawStringUtf8(xft_draw, &prompt_col, font,
                       PAD_X + 12, PAD_Y + INPUT_H / 2 + font->ascent / 2,
                       (FcChar8 *)PROMPT, strlen(PROMPT));
 
-    XftColor dim = xft_color(COL_DIM);
+    XftColor dim = xft_color(t.dim);
     XftDrawRect(xft_draw, &dim, PAD_X, PAD_Y + INPUT_H + 6, w - 2 * PAD_X, 1);
 
     int list_y = PAD_Y + INPUT_H + 14;
-    XftColor sel_bg   = xft_color(COL_SEL_BG);
-    XftColor sel_fg_c = xft_color(COL_SEL_FG);
-    XftColor fg = xft_color(COL_FG);
+    XftColor sel_bg   = xft_color(t.sel_bg);
+    XftColor sel_fg_c = xft_color(t.sel_fg);
+    XftColor fg = xft_color(t.fg);
 
     for (int i = 0; i < option_count; i++) {
         int iy = list_y + i * ITEM_H;
@@ -117,8 +112,10 @@ int main(void) {
     swa.event_mask = ExposureMask | KeyPressMask | FocusChangeMask | PointerMotionMask | ButtonPressMask;
     swa.border_pixel = 0;
     
+    Theme t = load_theme();
+    
     XftColor bg_c;
-    XftColorAllocName(dpy, visual, cmap, COL_BG, &bg_c);
+    XftColorAllocName(dpy, visual, cmap, t.bg, &bg_c);
     swa.background_pixel = bg_c.pixel;
 
     win = XCreateWindow(dpy, RootWindow(dpy, screen),
@@ -129,7 +126,7 @@ int main(void) {
                         &swa);
 
     XftColor border_c;
-    XftColorAllocName(dpy, visual, cmap, COL_BORDER, &border_c);
+    XftColorAllocName(dpy, visual, cmap, t.border, &border_c);
     XSetWindowBorder(dpy, win, border_c.pixel);
 
     font = XftFontOpenName(dpy, screen, FONT_NAME);
