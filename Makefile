@@ -13,12 +13,13 @@ LAUNCHER = nebula-launcher
 POWERMENU = nebula-powermenu
 LOCKSCREEN = nebula-lockscreen
 BAR = nebula-bar
+STARLIGHT = starlight
 
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 XSESSIONSDIR ?= /usr/share/xsessions
 
-all: $(EXEC) $(LAUNCHER) $(POWERMENU) $(LOCKSCREEN) $(BAR)
+all: $(EXEC) $(LAUNCHER) $(POWERMENU) $(LOCKSCREEN) $(BAR) $(STARLIGHT)
 
 $(EXEC): $(OBJ)
 	$(CC) $(OBJ) $(LIBS) $(XFT_LIBS) -o $(EXEC)
@@ -35,11 +36,14 @@ $(LOCKSCREEN): lockscreen.c
 $(BAR): bar.c
 	$(CC) $(CFLAGS) $(XFT_CFLAGS) bar.c $(XFT_LIBS) -o $(BAR)
 
+$(STARLIGHT): starlight.c
+	$(CC) $(CFLAGS) $(XFT_CFLAGS) starlight.c $(XFT_LIBS) -lutil -o $(STARLIGHT)
+
 %.o: %.c
 	$(CC) $(CFLAGS) $(XFT_CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OBJ) $(EXEC) $(LAUNCHER) $(POWERMENU) $(LOCKSCREEN) $(BAR)
+	rm -f $(OBJ) $(EXEC) $(LAUNCHER) $(POWERMENU) $(LOCKSCREEN) $(BAR) $(STARLIGHT)
 
 install: all
 	install -d $(DESTDIR)$(BINDIR)
@@ -48,6 +52,7 @@ install: all
 	install -m 755 $(POWERMENU) $(DESTDIR)$(BINDIR)/$(POWERMENU)
 	install -m 755 $(LOCKSCREEN) $(DESTDIR)$(BINDIR)/$(LOCKSCREEN)
 	install -m 755 $(BAR) $(DESTDIR)$(BINDIR)/$(BAR)
+	install -m 755 $(STARLIGHT) $(DESTDIR)$(BINDIR)/$(STARLIGHT)
 	install -d $(DESTDIR)$(XSESSIONSDIR)
 	install -m 644 nebulawm.desktop $(DESTDIR)$(XSESSIONSDIR)/nebulawm.desktop
 	@if [ -n "$$SUDO_USER" ]; then \
@@ -82,4 +87,5 @@ uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(POWERMENU)
 	rm -f $(DESTDIR)$(BINDIR)/$(LOCKSCREEN)
 	rm -f $(DESTDIR)$(BINDIR)/$(BAR)
+	rm -f $(DESTDIR)$(BINDIR)/$(STARLIGHT)
 	rm -f $(DESTDIR)$(XSESSIONSDIR)/nebulawm.desktop

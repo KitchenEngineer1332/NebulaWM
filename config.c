@@ -12,7 +12,7 @@ int config_border_width = 2;
 int config_bar_height = 30;
 unsigned long config_focused_color = 0x7aa2f7;
 unsigned long config_unfocused_color = 0x414868;
-char config_terminal[256] = "alacritty";
+char config_terminal[256] = "starlight";
 unsigned int config_modifier = Mod4Mask;
 char config_wallpaper[512] = "";
 char config_launcher[256] = "nebula-launcher";
@@ -45,7 +45,7 @@ void load_config(void) {
         if (f) {
             fprintf(f, "border_width=2\n");
             fprintf(f, "primary_color=#ff0055\n");
-            fprintf(f, "terminal=alacritty\n");
+            fprintf(f, "terminal=starlight\n");
             fprintf(f, "modifier=Mod4\n");
             fprintf(f, "wallpaper=\n");
             fprintf(f, "launcher=nebula-launcher\n");
