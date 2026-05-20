@@ -1,3 +1,5 @@
+#define _XOPEN_SOURCE 700
+#define _DEFAULT_SOURCE
 #include <X11/Xlib.h>
 #include <X11/keysym.h>
 #include <X11/XKBlib.h>
@@ -48,6 +50,14 @@ static int scroll_top, scroll_bot;
 static int win_w, win_h;
 
 static Cell *screen_buf;
+static Cell *pri_buf;
+static Cell *alt_buf;
+static int use_alt_buf = 0;
+static int pri_cx = 0, pri_cy = 0;
+
+static int pending_wrap = 0;
+static int cursor_visible = 1;
+
 static Cell *scroll_buf;
 static int scroll_lines = 0;
 static int scroll_off = 0;
@@ -126,24 +136,48 @@ static void scroll_down(int top, int bot) {
 }
 
 static void newline(void) {
+    pending_wrap = 0;
     if (cy >= scroll_bot) scroll_up(scroll_top, scroll_bot);
     else cy++;
 }
 
-static void put_char(const char *utf8, int len) {
-    if (cx >= cols) { cx=0; newline(); }
+static void put_char(const char *utf8, int len, int width) {
+    if (pending_wrap) {
+        cx = 0;
+        newline();
+        pending_wrap = 0;
+    }
+    if (cx + width > cols) {
+        cx = 0;
+        newline();
+    }
+    
     Cell *c = cell_at(cx, cy);
     memcpy(c->ch, utf8, len);
     c->len = len;
     c->fg = cur_fg; c->bg = cur_bg; c->attr = cur_attr;
-    cx++;
+    
+    if (width == 2 && cx + 1 < cols) {
+        Cell *nc = cell_at(cx + 1, cy);
+        nc->ch[0] = 0;
+        nc->len = 0;
+        nc->fg = cur_fg; nc->bg = cur_bg; nc->attr = cur_attr;
+    }
+
+    cx += width;
+    if (cx >= cols) {
+        cx = cols - 1;
+        pending_wrap = 1;
+    }
 }
 
 static void draw(void) {
     XftDrawRect(xdraw, &colors[17], 0, 0, win_w, win_h);
     Cell b_cell = blank_cell();
+    FcChar8 text_buf[8192];
     for (int y=0; y<rows; y++) {
-        for (int x=0; x<cols; x++) {
+        int x = 0;
+        while (x < cols) {
             Cell *c;
             if (scroll_off > 0) {
                 long abs_y = (long)scroll_lines - scroll_off + y;
@@ -159,23 +193,69 @@ static void draw(void) {
             } else {
                 c = cell_at(x, y);
             }
+
             int fg_i = c->fg, bg_i = c->bg;
             if (c->attr & ATTR_REVERSE) { int t=fg_i; fg_i=bg_i; bg_i=t; }
-            if (bg_i != 17)
-                XftDrawRect(xdraw, &colors[bg_i], x*cw, y*ch, cw, ch);
-            if (c->len > 0 && c->ch[0] != ' ') {
+
+            int run_len = 1;
+            int text_len = c->len;
+            if (text_len > 0) memcpy(text_buf, c->ch, c->len);
+
+            for (int nx = x + 1; nx < cols; nx++) {
+                Cell *nc;
+                if (scroll_off > 0) {
+                    long abs_y = (long)scroll_lines - scroll_off + y;
+                    if (abs_y < scroll_lines) {
+                        if (abs_y >= 0 && abs_y >= (long)scroll_lines - SCROLLBACK) {
+                            nc = &scroll_buf[(abs_y % SCROLLBACK)*cols + nx];
+                        } else nc = &b_cell;
+                    } else {
+                        int sy = abs_y - scroll_lines;
+                        if (sy >= 0 && sy < rows) nc = &screen_buf[sy*cols + nx];
+                        else nc = &b_cell;
+                    }
+                } else {
+                    nc = cell_at(nx, y);
+                }
+
+                int nfg = nc->fg, nbg = nc->bg;
+                if (nc->attr & ATTR_REVERSE) { int t=nfg; nfg=nbg; nbg=t; }
+
+                if (nfg == fg_i && nbg == bg_i && nc->attr == c->attr && text_len + nc->len < (int)sizeof(text_buf)) {
+                    run_len++;
+                    if (nc->len > 0) {
+                        memcpy(text_buf + text_len, nc->ch, nc->len);
+                        text_len += nc->len;
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            if (bg_i != 17) {
+                XftDrawRect(xdraw, &colors[bg_i], x*cw, y*ch, run_len*cw, ch);
+            }
+            if (text_len > 0) {
                 XftColor *fc = &colors[fg_i];
                 if (c->attr & ATTR_BOLD && fg_i < 8) fc = &colors[fg_i+8];
-                XftDrawStringUtf8(xdraw, fc, fnt, x*cw, y*ch+fnt->ascent,
-                    (FcChar8*)c->ch, c->len);
+                int all_spaces = 1;
+                for (int i=0; i<text_len; i++) {
+                    if (text_buf[i] != ' ' && text_buf[i] != 0) { all_spaces = 0; break; }
+                }
+                if (!all_spaces) {
+                    XftDrawStringUtf8(xdraw, fc, fnt, x*cw, y*ch+fnt->ascent, text_buf, text_len);
+                }
             }
-            if (c->attr & ATTR_UNDERLINE)
-                XftDrawRect(xdraw, &colors[fg_i], x*cw, y*ch+ch-1, cw, 1);
+            if (c->attr & ATTR_UNDERLINE) {
+                XftDrawRect(xdraw, &colors[fg_i], x*cw, y*ch+ch-1, run_len*cw, 1);
+            }
+
+            x += run_len;
         }
     }
     /* cursor */
-    if (scroll_off == 0) {
-        int cxp = cx < cols ? cx : cols-1;
+    if (scroll_off == 0 && cursor_visible) {
+        int cxp = pending_wrap ? cols - 1 : (cx < cols ? cx : cols-1);
         XftDrawRect(xdraw, &colors[16], cxp*cw, cy*ch, cw, ch);
         Cell *cc = cell_at(cxp, cy);
         if (cc->len > 0)
@@ -216,22 +296,26 @@ static void handle_sgr(void) {
 }
 
 static void handle_csi(char cmd) {
-    int params[8]={0}; parse_params(esc_buf,params,8);
+    int is_priv = (esc_buf[0] == '?');
+    const char *p_str = is_priv ? esc_buf + 1 : esc_buf;
+    int params[16]={0}; 
+    parse_params(p_str, params, 16);
     int a=params[0], b=params[1];
     switch(cmd) {
-    case 'A': cy -= a?a:1; if(cy<scroll_top) cy=scroll_top; break;
-    case 'B': cy += a?a:1; if(cy>scroll_bot) cy=scroll_bot; break;
-    case 'C': cx += a?a:1; if(cx>=cols) cx=cols-1; break;
-    case 'D': cx -= a?a:1; if(cx<0) cx=0; break;
-    case 'E': cx=0; cy+=a?a:1; if(cy>scroll_bot) cy=scroll_bot; break;
-    case 'F': cx=0; cy-=a?a:1; if(cy<scroll_top) cy=scroll_top; break;
-    case 'G': cx=(a?a:1)-1; if(cx>=cols) cx=cols-1; break;
+    case 'A': cy -= a?a:1; if(cy<scroll_top) cy=scroll_top; pending_wrap=0; break;
+    case 'B': cy += a?a:1; if(cy>scroll_bot) cy=scroll_bot; pending_wrap=0; break;
+    case 'C': cx += a?a:1; if(cx>=cols) cx=cols-1; pending_wrap=0; break;
+    case 'D': cx -= a?a:1; if(cx<0) cx=0; pending_wrap=0; break;
+    case 'E': cx=0; cy+=a?a:1; if(cy>scroll_bot) cy=scroll_bot; pending_wrap=0; break;
+    case 'F': cx=0; cy-=a?a:1; if(cy<scroll_top) cy=scroll_top; pending_wrap=0; break;
+    case 'G': cx=(a?a:1)-1; if(cx>=cols) cx=cols-1; pending_wrap=0; break;
     case 'H': case 'f':
         cy=(a?a:1)-1; cx=(b?b:1)-1;
         if(cy>=rows) cy=rows-1;
         if(cx>=cols) cx=cols-1;
         if(cy<0) cy=0;
         if(cx<0) cx=0;
+        pending_wrap=0;
         break;
     case 'J':
         if(a==0) { clear_region(cx,cy,cols-1,cy); clear_region(0,cy+1,cols-1,rows-1); }
@@ -257,15 +341,15 @@ static void handle_csi(char cmd) {
     } break;
     case 'S': for(int i=0;i<(a?a:1);i++) scroll_up(scroll_top,scroll_bot); break;
     case 'T': for(int i=0;i<(a?a:1);i++) scroll_down(scroll_top,scroll_bot); break;
-    case 'd': cy=(a?a:1)-1; if(cy>=rows) cy=rows-1; break;
+    case 'd': cy=(a?a:1)-1; if(cy>=rows) cy=rows-1; pending_wrap=0; break;
     case 'm': handle_sgr(); break;
     case 'r':
         scroll_top=(a?a:1)-1; scroll_bot=(b?b:rows)-1;
         if(scroll_top<0) scroll_top=0;
         if(scroll_bot>=rows) scroll_bot=rows-1;
-        cx=0; cy=0; break;
+        cx=0; cy=0; pending_wrap=0; break;
     case 's': save_cx=cx; save_cy=cy; break;
-    case 'u': cx=save_cx; cy=save_cy; break;
+    case 'u': cx=save_cx; cy=save_cy; pending_wrap=0; break;
     case '@': {
         int n=a?a:1;
         for(int x=cols-1;x>=cx+n;x--) screen_buf[cy*cols+x]=screen_buf[cy*cols+x-n];
@@ -279,14 +363,62 @@ static void handle_csi(char cmd) {
     case 'c': {
         char r[32]; snprintf(r,sizeof(r),"\033[?6c"); write(master_fd,r,strlen(r));
     } break;
-    case 'l': case 'h': break; /* mode set/reset - ignore for now */
+    case 'l': case 'h': 
+        if (is_priv) {
+            int mode = a;
+            int set = (cmd == 'h');
+            if (mode == 25) {
+                cursor_visible = set;
+            } else if (mode == 1049) {
+                if (set && !use_alt_buf) {
+                    pri_cx = cx; pri_cy = cy;
+                    use_alt_buf = 1;
+                    screen_buf = alt_buf;
+                    clear_region(0,0,cols-1,rows-1);
+                    cx = 0; cy = 0;
+                    pending_wrap = 0;
+                } else if (!set && use_alt_buf) {
+                    use_alt_buf = 0;
+                    screen_buf = pri_buf;
+                    cx = pri_cx; cy = pri_cy;
+                    pending_wrap = 0;
+                }
+            }
+        }
+        break;
     }
 }
 
+static mbstate_t ps;
+static char utf8_buf[4];
+static int utf8_len = 0;
+
 static void process_byte(unsigned char c) {
     scroll_off = 0;
+    
+    if (c < 32) {
+        if (c==7 && esc_state==3) { esc_state=0; esc_len=0; return; }
+        if (c=='\r') { cx=0; pending_wrap=0; return; }
+        if (c=='\n') { newline(); return; }
+        if (c=='\b') { 
+            if (pending_wrap) pending_wrap = 0; 
+            else if (cx>0) cx--; 
+            return; 
+        }
+        if (c=='\t') { 
+            cx=((cx/TAB_WIDTH)+1)*TAB_WIDTH; 
+            if(cx>=cols) { cx=cols-1; pending_wrap=1; }
+            return; 
+        }
+        if (c==27) { 
+            esc_state=1; esc_len=0; utf8_len=0; memset(&ps, 0, sizeof(ps)); return; 
+        }
+        if (c==7) return; /* bell */
+        return; /* ignore other controls */
+    }
+
     if (esc_state==3) { /* OSC - eat until ST or BEL */
-        if (c==7 || c==0x9c) { esc_state=0; esc_len=0; }
+        if (c==0x9c) { esc_state=0; esc_len=0; }
         else if (c==27) esc_state=4; /* possible ST */
         return;
     }
@@ -302,23 +434,33 @@ static void process_byte(unsigned char c) {
         if (c=='[') { esc_state=2; memset(esc_buf,0,MAX_ESC); }
         else if (c==']') { esc_state=3; }
         else if (c=='D') newline();
-        else if (c=='M') { if(cy<=scroll_top) scroll_down(scroll_top,scroll_bot); else cy--; }
+        else if (c=='M') { if(cy<=scroll_top) scroll_down(scroll_top,scroll_bot); else cy--; pending_wrap=0; }
         else if (c=='7') { save_cx=cx; save_cy=cy; }
-        else if (c=='8') { cx=save_cx; cy=save_cy; }
-        else if (c=='c') { clear_region(0,0,cols-1,rows-1); cx=cy=0; cur_fg=16; cur_bg=17; cur_attr=0; }
+        else if (c=='8') { cx=save_cx; cy=save_cy; pending_wrap=0; }
+        else if (c=='c') { clear_region(0,0,cols-1,rows-1); cx=cy=0; cur_fg=16; cur_bg=17; cur_attr=0; pending_wrap=0; }
         return;
     }
-    /* normal */
-    if (c==27) { esc_state=1; return; }
-    if (c=='\r') { cx=0; return; }
-    if (c=='\n') { newline(); return; }
-    if (c=='\b') { if(cx>0) cx--; return; }
-    if (c=='\t') { cx=((cx/TAB_WIDTH)+1)*TAB_WIDTH; if(cx>=cols) cx=cols-1; return; }
-    if (c==7) return; /* bell */
-    if (c<32) return; /* other control */
+    
     /* UTF-8 handling */
-    char utf[4]={(char)c,0,0,0}; int ulen=1;
-    put_char(utf, ulen);
+    utf8_buf[utf8_len++] = c;
+    wchar_t wc;
+    size_t res = mbrtowc(&wc, utf8_buf, utf8_len, &ps);
+    if (res == (size_t)-1) {
+        utf8_len = 0;
+        memset(&ps, 0, sizeof(ps));
+    } else if (res == (size_t)-2) {
+        if (utf8_len >= 4) {
+            utf8_len = 0;
+            memset(&ps, 0, sizeof(ps));
+        }
+    } else {
+        int width = wcwidth(wc);
+        if (width < 0) width = 1;
+        if (width > 0) {
+            put_char(utf8_buf, utf8_len, width);
+        }
+        utf8_len = 0;
+    }
 }
 
 static void resize_term(void) {
@@ -331,29 +473,96 @@ static void resize_term(void) {
     if (new_rows<2) new_rows=2;
     if (new_cols==cols && new_rows==rows) return;
 
-    Cell *nb = calloc(new_rows*new_cols, sizeof(Cell));
+    Cell *n_pri = calloc(new_rows*new_cols, sizeof(Cell));
+    Cell *n_alt = calloc(new_rows*new_cols, sizeof(Cell));
     Cell b = blank_cell();
-    for (int i=0;i<new_rows*new_cols;i++) nb[i]=b;
-    int copy_r = rows<new_rows?rows:new_rows;
-    int copy_c = cols<new_cols?cols:new_cols;
-    if (screen_buf) {
-        for (int y=0;y<copy_r;y++)
-            for (int x=0;x<copy_c;x++)
-                nb[y*new_cols+x] = screen_buf[y*cols+x];
-        free(screen_buf);
+    b.fg = 16; b.bg = 17; b.attr = 0;
+    for (int i=0;i<new_rows*new_cols;i++) {
+        n_pri[i]=b; n_alt[i]=b;
     }
-    screen_buf = nb;
+
+    int min_row = 0;
+    int pull_lines = 0;
+
+    if (!use_alt_buf) {
+        if (new_rows < rows) {
+            if (cy >= new_rows) {
+                min_row = cy - new_rows + 1;
+                for (int i=0; i<min_row; i++) {
+                    int idx = scroll_lines % SCROLLBACK;
+                    memcpy(&scroll_buf[idx*cols], &pri_buf[i*cols], cols*sizeof(Cell));
+                    scroll_lines++;
+                }
+            }
+        } else if (new_rows > rows) {
+            pull_lines = new_rows - rows;
+            if (pull_lines > scroll_lines) pull_lines = scroll_lines;
+        }
+    }
+
+    int copy_r = rows - min_row;
+    if (copy_r > new_rows) copy_r = new_rows;
+    int copy_c = cols < new_cols ? cols : new_cols;
+
+    if (pri_buf) {
+        for (int y=0;y<copy_r;y++) {
+            for (int x=0;x<copy_c;x++) {
+                n_pri[(y + pull_lines)*new_cols + x] = pri_buf[(min_row+y)*cols+x];
+            }
+        }
+        if (pull_lines > 0) {
+            for (int i=0; i<pull_lines; i++) {
+                int scroll_idx = (scroll_lines - pull_lines + i) % SCROLLBACK;
+                for (int x=0; x<copy_c; x++) {
+                    n_pri[i*new_cols + x] = scroll_buf[scroll_idx*cols + x];
+                }
+            }
+            scroll_lines -= pull_lines;
+        }
+        free(pri_buf);
+    }
+    
+    if (alt_buf) {
+        int alt_copy_r = rows < new_rows ? rows : new_rows;
+        for (int y=0;y<alt_copy_r;y++) {
+            for (int x=0;x<copy_c;x++) {
+                n_alt[y*new_cols + x] = alt_buf[y*cols+x];
+            }
+        }
+        free(alt_buf);
+    }
+
+    pri_buf = n_pri;
+    alt_buf = n_alt;
+    screen_buf = use_alt_buf ? alt_buf : pri_buf;
     
     Cell *nsb = calloc(SCROLLBACK*new_cols, sizeof(Cell));
-    if (scroll_buf) free(scroll_buf);
+    for (int i=0;i<SCROLLBACK*new_cols;i++) nsb[i]=b;
+    if (scroll_buf) {
+        for (int i=0; i<SCROLLBACK; i++) {
+            for (int x=0; x<copy_c; x++) {
+                nsb[i*new_cols+x] = scroll_buf[i*cols+x];
+            }
+        }
+        free(scroll_buf);
+    }
     scroll_buf = nsb;
-    scroll_lines = 0;
-    scroll_off = 0;
 
     cols=new_cols; rows=new_rows;
     scroll_top=0; scroll_bot=rows-1;
+    
+    if (!use_alt_buf) {
+        cy = cy - min_row + pull_lines;
+    } else {
+        if (cy >= rows) cy = rows - 1;
+    }
+    
     if(cx>=cols) cx=cols-1;
     if(cy>=rows) cy=rows-1;
+    if(cy<0) cy=0;
+    
+    if (pri_cx >= cols) pri_cx = cols-1;
+    if (pri_cy >= rows) pri_cy = rows-1;
 
     if (buf) XFreePixmap(dpy, buf);
     buf = XCreatePixmap(dpy, win, win_w, win_h, DefaultDepth(dpy,scr));
@@ -433,9 +642,10 @@ int main(void) {
 
     XSetWindowAttributes swa;
     swa.event_mask = ExposureMask|KeyPressMask|StructureNotifyMask|FocusChangeMask;
-    swa.background_pixel = colors[17].pixel;
+    swa.background_pixmap = None;
+    swa.bit_gravity = NorthWestGravity;
     win = XCreateWindow(dpy, RootWindow(dpy,scr), 100,100, win_w,win_h, 0,
-        CopyFromParent, InputOutput, vis, CWEventMask|CWBackPixel, &swa);
+        CopyFromParent, InputOutput, vis, CWEventMask|CWBackPixmap|CWBitGravity, &swa);
 
     XClassHint cls = { .res_name="starlight", .res_class="Starlight" };
     XSetClassHint(dpy, win, &cls);
@@ -454,10 +664,12 @@ int main(void) {
     xdraw = XftDrawCreate(dpy, buf, vis, cmap);
     xgc = XCreateGC(dpy, win, 0, NULL);
 
-    screen_buf = calloc(rows*cols, sizeof(Cell));
+    pri_buf = calloc(rows*cols, sizeof(Cell));
+    alt_buf = calloc(rows*cols, sizeof(Cell));
+    screen_buf = pri_buf;
     scroll_buf = calloc(SCROLLBACK*cols, sizeof(Cell));
     Cell b = blank_cell();
-    for (int i=0;i<rows*cols;i++) screen_buf[i]=b;
+    for (int i=0;i<rows*cols;i++) { pri_buf[i]=b; alt_buf[i]=b; }
     scroll_top=0; scroll_bot=rows-1;
 
     /* Fork PTY */
@@ -485,7 +697,7 @@ int main(void) {
         if (master_fd >= 0) FD_SET(master_fd, &rfds);
         int maxfd = xfd > master_fd ? xfd : master_fd;
         struct timeval tv = {0, 16000};
-        select(maxfd+1, &rfds, NULL, NULL, &tv);
+        select(maxfd+1, &rfds, NULL, NULL, dirty ? &tv : NULL);
 
         /* Read PTY */
         if (master_fd >= 0 && FD_ISSET(master_fd, &rfds)) {
@@ -497,17 +709,18 @@ int main(void) {
         }
 
         /* X11 events */
+        int needs_immediate_draw = 0;
         while (XPending(dpy)) {
             XEvent ev; XNextEvent(dpy, &ev);
-            if (ev.type == Expose && ev.xexpose.count == 0) dirty = 1;
+            if (ev.type == Expose && ev.xexpose.count == 0) { dirty = 1; needs_immediate_draw = 1; }
             else if (ev.type == KeyPress) { handle_key(&ev.xkey); dirty = 1; }
-            else if (ev.type == ConfigureNotify) { resize_term(); dirty = 1; }
+            else if (ev.type == ConfigureNotify) { resize_term(); dirty = 1; needs_immediate_draw = 1; }
         }
 
         /* Redraw at ~60fps */
         struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
         long ms = (now.tv_sec-last.tv_sec)*1000 + (now.tv_nsec-last.tv_nsec)/1000000;
-        if (dirty && ms >= 16) { draw(); last = now; dirty = 0; }
+        if (dirty && (ms >= 16 || needs_immediate_draw)) { draw(); clock_gettime(CLOCK_MONOTONIC, &last); dirty = 0; }
     }
 
     close(master_fd);
@@ -517,7 +730,8 @@ int main(void) {
     XFreeGC(dpy, xgc);
     XDestroyWindow(dpy, win);
     XCloseDisplay(dpy);
-    free(screen_buf);
+    free(pri_buf);
+    free(alt_buf);
     free(scroll_buf);
     return 0;
 }

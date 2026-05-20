@@ -396,7 +396,7 @@ void show_hide_windows() {
 void grab_keys() {
     XGrabKey(dpy, XKeysymToKeycode(dpy, XStringToKeysym("Return")), config_modifier, root, True, GrabModeAsync, GrabModeAsync);
     XGrabKey(dpy, XKeysymToKeycode(dpy, XStringToKeysym("q")), config_modifier, root, True, GrabModeAsync, GrabModeAsync);
-    XGrabKey(dpy, XKeysymToKeycode(dpy, XStringToKeysym("c")), config_modifier, root, True, GrabModeAsync, GrabModeAsync);
+    XGrabKey(dpy, XKeysymToKeycode(dpy, XStringToKeysym("q")), config_modifier | ShiftMask, root, True, GrabModeAsync, GrabModeAsync);
     XGrabKey(dpy, XKeysymToKeycode(dpy, XStringToKeysym("d")), config_modifier, root, True, GrabModeAsync, GrabModeAsync);
     XGrabKey(dpy, XKeysymToKeycode(dpy, XStringToKeysym("Delete")), ControlMask | Mod1Mask, root, True, GrabModeAsync, GrabModeAsync);
     
@@ -533,9 +533,9 @@ int main() {
                     _exit(1);
                 }
             } else if (keysym == XStringToKeysym("q")) {
-                running = 0;
-            } else if (keysym == XStringToKeysym("c")) {
-                if (focused_win) {
+                if (ev.xkey.state & ShiftMask) {
+                    running = 0;
+                } else if (focused_win) {
                     XKillClient(dpy, focused_win);
                 }
             } else if (keysym == XStringToKeysym("d")) {
