@@ -28,6 +28,8 @@ int config_pos_y = -1;
 static Display *dpy;
 static int screen;
 static Window win;
+static Pixmap pmap;
+static GC gc;
 static XftDraw *xft_draw;
 static XftFont *font, *date_font;
 static Colormap cmap;
@@ -38,6 +40,9 @@ static char password[MAX_PASS_LEN];
 static int pass_len = 0;
 static int auth_failed = 0;
 static int pass_hidden = 0;
+
+static Theme lock_theme;
+static XftColor color_bg, color_fg, color_indicator;
 
 static XftColor xft_color(const char *hex) {
     XftColor c;
@@ -113,15 +118,13 @@ static int authenticate(void) {
 static void draw(void) {
     int sw = DisplayWidth(dpy, screen);
     int sh = DisplayHeight(dpy, screen);
-    Theme t = load_theme();
 
     if (bg_image) {
         imlib_context_set_image(bg_image);
-        imlib_context_set_drawable(win);
+        imlib_context_set_drawable(pmap);
         imlib_render_image_on_drawable(0, 0);
     } else {
-        XftColor bg = xft_color(t.bg);
-        XftDrawRect(xft_draw, &bg, 0, 0, sw, sh);
+        XftDrawRect(xft_draw, &color_bg, 0, 0, sw, sh);
     }
 
     time_t rawtime;
@@ -144,24 +147,24 @@ static void draw(void) {
     int dx = config_pos_x == -1 ? (sw - date_extents.width) / 2 : config_pos_x;
     int dy = ty + 40;
 
-    XftColor fg = xft_color(t.fg);
-    XftDrawStringUtf8(xft_draw, &fg, font, tx, ty, (FcChar8 *)time_str, strlen(time_str));
-    XftDrawStringUtf8(xft_draw, &fg, date_font, dx, dy, (FcChar8 *)date_str, strlen(date_str));
+    XftDrawStringUtf8(xft_draw, &color_fg, font, tx, ty, (FcChar8 *)time_str, strlen(time_str));
+    XftDrawStringUtf8(xft_draw, &color_fg, date_font, dx, dy, (FcChar8 *)date_str, strlen(date_str));
 
-    XftColor ind_c = xft_color(t.indicator);
     int ind_y = dy + 60;
     if (auth_failed == 1) {
         char *fail_msg = "Wrong password";
         XGlyphInfo fail_ext;
         XftTextExtentsUtf8(dpy, date_font, (FcChar8 *)fail_msg, strlen(fail_msg), &fail_ext);
-        XftDrawStringUtf8(xft_draw, &ind_c, date_font, (sw - fail_ext.width) / 2, ind_y, (FcChar8 *)fail_msg, strlen(fail_msg));
+        XftDrawStringUtf8(xft_draw, &color_indicator, date_font, (sw - fail_ext.width) / 2, ind_y, (FcChar8 *)fail_msg, strlen(fail_msg));
     } else if (pass_len > 0 && !pass_hidden) {
         int total_w = pass_len * 15;
         int ind_x = (sw - total_w) / 2;
         for (int i = 0; i < pass_len; i++) {
-            XftDrawStringUtf8(xft_draw, &ind_c, date_font, ind_x + i * 15, ind_y, (FcChar8 *)"*", 1);
+            XftDrawStringUtf8(xft_draw, &color_indicator, date_font, ind_x + i * 15, ind_y, (FcChar8 *)"*", 1);
         }
     }
+
+    XCopyArea(dpy, pmap, win, gc, 0, 0, sw, sh, 0, 0);
 }
 
 int main(void) {
@@ -181,9 +184,12 @@ int main(void) {
     swa.override_redirect = True;
     swa.event_mask = ExposureMask | KeyPressMask;
     
-    Theme t = load_theme();
-    XftColor bg_c = xft_color(t.bg);
-    swa.background_pixel = bg_c.pixel;
+    lock_theme = load_theme();
+    color_bg = xft_color(lock_theme.bg);
+    color_fg = xft_color(lock_theme.fg);
+    color_indicator = xft_color(lock_theme.indicator);
+
+    swa.background_pixel = color_bg.pixel;
 
     win = XCreateWindow(dpy, RootWindow(dpy, screen),
                         0, 0, sw, sh, 0,
@@ -191,13 +197,16 @@ int main(void) {
                         CWOverrideRedirect | CWEventMask | CWBackPixel,
                         &swa);
 
+    pmap = XCreatePixmap(dpy, win, sw, sh, DefaultDepth(dpy, screen));
+    gc = XCreateGC(dpy, win, 0, NULL);
+
     font = XftFontOpenName(dpy, screen, config_font);
     if (!font) font = XftFontOpenName(dpy, screen, "fixed");
 
     date_font = XftFontOpenName(dpy, screen, config_date_font);
     if (!date_font) date_font = XftFontOpenName(dpy, screen, "fixed");
 
-    xft_draw = XftDrawCreate(dpy, win, visual, cmap);
+    xft_draw = XftDrawCreate(dpy, pmap, visual, cmap);
 
     imlib_context_set_display(dpy);
     imlib_context_set_visual(visual);
@@ -247,10 +256,11 @@ int main(void) {
     XEvent ev;
 
     while (running) {
+        int needs_draw = 0;
         while (XPending(dpy)) {
             XNextEvent(dpy, &ev);
             if (ev.type == Expose && ev.xexpose.count == 0) {
-                draw();
+                needs_draw = 1;
             } else if (ev.type == KeyPress) {
                 auth_failed = 0;
                 char buf[32];
@@ -286,12 +296,21 @@ int main(void) {
                         password[pass_len++] = buf[0];
                     }
                 }
-                draw();
+                needs_draw = 1;
             }
         }
 
-        draw();
-        XFlush(dpy);
+        static time_t last_t = 0;
+        time_t now = time(NULL);
+        if (now != last_t) {
+            needs_draw = 1;
+            last_t = now;
+        }
+
+        if (needs_draw) {
+            draw();
+            XFlush(dpy);
+        }
 
         struct timeval tv;
         tv.tv_sec = 1;
@@ -313,9 +332,15 @@ int main(void) {
         imlib_free_image();
     }
 
+    XftColorFree(dpy, visual, cmap, &color_bg);
+    XftColorFree(dpy, visual, cmap, &color_fg);
+    XftColorFree(dpy, visual, cmap, &color_indicator);
+
     XftDrawDestroy(xft_draw);
     XftFontClose(dpy, font);
     XftFontClose(dpy, date_font);
+    XFreePixmap(dpy, pmap);
+    XFreeGC(dpy, gc);
     XDestroyWindow(dpy, win);
     XCloseDisplay(dpy);
 

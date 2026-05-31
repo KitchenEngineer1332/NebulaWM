@@ -134,11 +134,25 @@ int get_ram_usage() {
     return (int)((total - available) * 100 / total);
 }
 
-int get_volume() {
-    FILE *f = popen("amixer get Master | awk -F\"[][]\" '/Left:/ { print $2 }' | head -n1 | sed 's/%//'", "r");
+int get_volume(void) {
+    FILE *f = popen("amixer get Master", "r");
     if (!f) return -1;
+    char line[256];
     int vol = -1;
-    if (fscanf(f, "%d", &vol) == 0) vol = -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, "Playback") && strchr(line, '[')) {
+            char *start = strchr(line, '[');
+            if (start) {
+                start++;
+                char *end = strchr(start, '%');
+                if (end) {
+                    *end = '\0';
+                    vol = atoi(start);
+                    break;
+                }
+            }
+        }
+    }
     pclose(f);
     return vol;
 }
@@ -178,23 +192,26 @@ void draw_bar(BarWindow *bar) {
         XFree(prop_layout);
     }
 
-    // Identify occupied workspaces
+    // Identify occupied workspaces using _NET_CLIENT_LIST
     int occupied[9] = {0};
-    unsigned int n;
-    Window root_return, parent_return, *children;
-    XQueryTree(dpy, RootWindow(dpy, screen), &root_return, &parent_return, &children, &n);
-    for (unsigned int i = 0; i < n; i++) {
-        unsigned char *prop_ws = NULL;
-        if (XGetWindowProperty(dpy, children[i], XInternAtom(dpy, "_NET_WM_DESKTOP", False),
-                               0, 1, False, XA_CARDINAL, &actual_type, &actual_format, &nitems, &bytes_after, &prop_ws) == Success && prop_ws) {
-            if (nitems > 0) {
-                int ws = *(unsigned long *)prop_ws;
-                if (ws >= 0 && ws < 9) occupied[ws] = 1;
+    unsigned char *prop_clients = NULL;
+    if (XGetWindowProperty(dpy, RootWindow(dpy, screen), XInternAtom(dpy, "_NET_CLIENT_LIST", False),
+                           0, 1024, False, XA_WINDOW, &actual_type, &actual_format, &nitems, &bytes_after, &prop_clients) == Success && prop_clients) {
+        Window *wins = (Window *)prop_clients;
+        for (unsigned long i = 0; i < nitems; i++) {
+            unsigned char *prop_ws = NULL;
+            unsigned long nitems_ws, bytes_after_ws;
+            if (XGetWindowProperty(dpy, wins[i], XInternAtom(dpy, "_NET_WM_DESKTOP", False),
+                                   0, 1, False, XA_CARDINAL, &actual_type, &actual_format, &nitems_ws, &bytes_after_ws, &prop_ws) == Success && prop_ws) {
+                if (nitems_ws > 0) {
+                    int ws = *(unsigned long *)prop_ws;
+                    if (ws >= 0 && ws < 9) occupied[ws] = 1;
+                }
+                XFree(prop_ws);
             }
-            XFree(prop_ws);
         }
+        XFree(prop_clients);
     }
-    if (children) XFree(children);
 
     XftColor *active = &color_active;
     XftColor *inactive = &color_inactive;
@@ -238,24 +255,27 @@ void draw_bar(BarWindow *bar) {
     char status_str[256];
     strftime(status_str, sizeof(status_str), "%a %d %b %H:%M:%S", timeinfo);
     
-    char sys_str[128];
-    snprintf(sys_str, sizeof(sys_str), " | CPU: %.1f%% | RAM: %d%%", get_cpu_usage(), get_ram_usage());
+    static char sys_cache[128] = "";
+    static time_t last_sys_update = 0;
     
-    int vol = get_volume();
-    if (vol != -1) {
-        char vol_str[16];
-        snprintf(vol_str, sizeof(vol_str), " | Vol: %d%%", vol);
-        strncat(sys_str, vol_str, sizeof(sys_str) - strlen(sys_str) - 1);
+    if (rawtime - last_sys_update >= 5) {
+        snprintf(sys_cache, sizeof(sys_cache), " | CPU: %.1f%% | RAM: %d%%", get_cpu_usage(), get_ram_usage());
+        int vol = get_volume();
+        if (vol != -1) {
+            char vol_str[16];
+            snprintf(vol_str, sizeof(vol_str), " | Vol: %d%%", vol);
+            strncat(sys_cache, vol_str, sizeof(sys_cache) - strlen(sys_cache) - 1);
+        }
+        int bat = get_battery_capacity();
+        if (bat != -1) {
+            char bat_str[32];
+            snprintf(bat_str, sizeof(bat_str), " | Bat: %d%% (%s)", bat, get_battery_status());
+            strncat(sys_cache, bat_str, sizeof(sys_cache) - strlen(sys_cache) - 1);
+        }
+        last_sys_update = rawtime;
     }
     
-    strncat(status_str, sys_str, sizeof(status_str) - strlen(status_str) - 1);
-
-    int bat = get_battery_capacity();
-    if (bat != -1) {
-        char bat_str[32];
-        snprintf(bat_str, sizeof(bat_str), " | Bat: %d%% (%s)", bat, get_battery_status());
-        strncat(status_str, bat_str, sizeof(status_str) - strlen(status_str) - 1);
-    }
+    strncat(status_str, sys_cache, sizeof(status_str) - strlen(status_str) - 1);
 
     XGlyphInfo extents;
     XftTextExtentsUtf8(dpy, font, (FcChar8 *)status_str, strlen(status_str), &extents);

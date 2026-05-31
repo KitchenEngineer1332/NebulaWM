@@ -4,6 +4,7 @@
 #include <X11/Xatom.h>
 #include <X11/Xft/Xft.h>
 #include <X11/Xutil.h>
+#include <X11/extensions/Xinerama.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,12 +12,25 @@
 #include "config.h"
 #include "theme.h"
 
+typedef struct Client Client;
+struct Client {
+    Window win;
+    int x, y, w, h;
+    int ws;
+    int is_dock;
+    int is_floating;
+    Client *next;
+    Client *prev;
+};
+
 Display *dpy;
 Window root;
 Window focused_win = 0;
 Window last_focused[9] = {0};
 int current_workspace = 0;
 int layout_modes[9] = {0};
+
+Client *clients = NULL;
 
 /* Focus Stack for MRU */
 Window focus_stack[1024];
@@ -45,9 +59,102 @@ void add_to_stack(Window w) {
     }
 }
 
+Client* find_client(Window w) {
+    for (Client *c = clients; c; c = c->next) {
+        if (c->win == w) return c;
+    }
+    return NULL;
+}
+
+void update_client_list() {
+    Atom prop = XInternAtom(dpy, "_NET_CLIENT_LIST", False);
+    int count = 0;
+    for (Client *c = clients; c; c = c->next) count++;
+    
+    Window *wins = malloc(sizeof(Window) * count);
+    int i = 0;
+    for (Client *c = clients; c; c = c->next) wins[i++] = c->win;
+    
+    XChangeProperty(dpy, root, prop, XA_WINDOW, 32, PropModeReplace, (unsigned char *)wins, count);
+    free(wins);
+}
+
+void add_client(Window w) {
+    if (find_client(w)) return;
+    
+    XWindowAttributes wa;
+    if (!XGetWindowAttributes(dpy, w, &wa)) return;
+    if (wa.override_redirect) return;
+
+    Client *c = calloc(1, sizeof(Client));
+    c->win = w;
+    c->x = wa.x;
+    c->y = wa.y;
+    c->w = wa.width;
+    c->h = wa.height;
+
+    // Check if dock or floating type
+    Atom actual_type;
+    int actual_format;
+    unsigned long nitems, bytes_after;
+    unsigned char *prop = NULL;
+    Atom dock = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DOCK", False);
+    Atom dialog = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DIALOG", False);
+    Atom utility = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_UTILITY", False);
+    Atom toolbar = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_TOOLBAR", False);
+    Atom splash = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_SPLASH", False);
+    Atom type_atom = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
+    
+    if (XGetWindowProperty(dpy, w, type_atom, 0, 1, False, XA_ATOM,
+                           &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success && prop) {
+        Atom t = *(Atom *)prop;
+        if (t == dock) c->is_dock = 1;
+        if (t == dialog || t == utility || t == toolbar || t == splash) c->is_floating = 1;
+        XFree(prop);
+    }
+
+    Window trans;
+    if (XGetTransientForHint(dpy, w, &trans)) c->is_floating = 1;
+
+    // Get workspace
+    c->ws = -1;
+    if (XGetWindowProperty(dpy, w, XInternAtom(dpy, "_NET_WM_DESKTOP", False),
+                           0, 1, False, XA_CARDINAL, &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success && prop) {
+        if (nitems > 0) c->ws = *(unsigned long *)prop;
+        XFree(prop);
+    }
+
+    if (c->ws == -1 && !c->is_dock) {
+        c->ws = current_workspace;
+        unsigned long ws = c->ws;
+        XChangeProperty(dpy, w, XInternAtom(dpy, "_NET_WM_DESKTOP", False), XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&ws, 1);
+    }
+
+    c->next = clients;
+    if (clients) clients->prev = c;
+    clients = c;
+    
+    if (!c->is_dock && wa.map_state == IsViewable) {
+        add_to_stack(w);
+    }
+    update_client_list();
+}
+
+void remove_client(Window w) {
+    Client *c = find_client(w);
+    if (!c) return;
+
+    if (c->prev) c->prev->next = c->next;
+    if (c->next) c->next->prev = c->prev;
+    if (c == clients) clients = c->next;
+
+    free(c);
+    remove_from_stack(w);
+    update_client_list();
+}
+
 /* Prototypes */
 void update_workspace_hints();
-int is_dock(Window w);
 void set_focus(Window w);
 void show_hide_windows();
 void tile_windows(int ws);
@@ -68,6 +175,29 @@ XftFont *switcher_font = NULL;
 XftDraw *switcher_draw = NULL;
 Colormap switcher_cmap;
 Visual *switcher_visual;
+Pixmap switcher_buffer = 0;
+XftDraw *switcher_buffer_draw = NULL;
+
+XftColor s_bg, s_fg, s_sel_bg, s_sel_fg, s_dim, s_border;
+
+void alloc_switcher_colors() {
+    Theme t = load_theme();
+    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.bg, &s_bg);
+    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.fg, &s_fg);
+    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.sel_bg, &s_sel_bg);
+    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.sel_fg, &s_sel_fg);
+    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.dim, &s_dim);
+    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.border, &s_border);
+}
+
+void free_switcher_colors() {
+    XftColorFree(dpy, switcher_visual, switcher_cmap, &s_bg);
+    XftColorFree(dpy, switcher_visual, switcher_cmap, &s_fg);
+    XftColorFree(dpy, switcher_visual, switcher_cmap, &s_sel_bg);
+    XftColorFree(dpy, switcher_visual, switcher_cmap, &s_sel_fg);
+    XftColorFree(dpy, switcher_visual, switcher_cmap, &s_dim);
+    XftColorFree(dpy, switcher_visual, switcher_cmap, &s_border);
+}
 
 void draw_switcher() {
     if (!switcher_win) return;
@@ -75,22 +205,13 @@ void draw_switcher() {
     int ww = 600;
     int wh = 400;
 
-    Theme t = load_theme();
-    XftColor bg, fg, sel_bg, sel_fg, dim, border;
-    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.bg, &bg);
-    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.fg, &fg);
-    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.sel_bg, &sel_bg);
-    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.sel_fg, &sel_fg);
-    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.dim, &dim);
-    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.border, &border);
-
     // Main background
-    XftDrawRect(switcher_draw, &bg, 0, 0, ww, wh);
+    XftDrawRect(switcher_buffer_draw, &s_bg, 0, 0, ww, wh);
     
     // Header
-    XftDrawRect(switcher_draw, &sel_bg, 0, 0, ww, 60);
+    XftDrawRect(switcher_buffer_draw, &s_sel_bg, 0, 0, ww, 60);
     char title[] = "Switch Window";
-    XftDrawStringUtf8(switcher_draw, &sel_fg, switcher_font, 20, 40, (FcChar8 *)title, strlen(title));
+    XftDrawStringUtf8(switcher_buffer_draw, &s_sel_fg, switcher_font, 20, 40, (FcChar8 *)title, strlen(title));
 
     int item_h = 45;
     int start_y = 80;
@@ -99,15 +220,15 @@ void draw_switcher() {
     for (int i = 0; i < switcher_count; i++) {
         int iy = start_y + i * item_h;
         if (i == switcher_selected) {
-            XftDrawRect(switcher_draw, &sel_bg, 10, iy - 32, list_w - 20, item_h);
-            XftDrawStringUtf8(switcher_draw, &sel_fg, switcher_font, 25, iy, (FcChar8 *)switcher_items[i].name, strlen(switcher_items[i].name));
+            XftDrawRect(switcher_buffer_draw, &s_sel_bg, 10, iy - 32, list_w - 20, item_h);
+            XftDrawStringUtf8(switcher_buffer_draw, &s_sel_fg, switcher_font, 25, iy, (FcChar8 *)switcher_items[i].name, strlen(switcher_items[i].name));
         } else {
-            XftDrawStringUtf8(switcher_draw, &fg, switcher_font, 25, iy, (FcChar8 *)switcher_items[i].name, strlen(switcher_items[i].name));
+            XftDrawStringUtf8(switcher_buffer_draw, &s_fg, switcher_font, 25, iy, (FcChar8 *)switcher_items[i].name, strlen(switcher_items[i].name));
         }
         
         char ws_info[16];
         snprintf(ws_info, sizeof(ws_info), "WS %d", switcher_items[i].workspace + 1);
-        XftDrawStringUtf8(switcher_draw, &dim, switcher_font, list_w - 60, iy, (FcChar8 *)ws_info, strlen(ws_info));
+        XftDrawStringUtf8(switcher_buffer_draw, &s_dim, switcher_font, list_w - 60, iy, (FcChar8 *)ws_info, strlen(ws_info));
     }
 
     // Preview area (right side)
@@ -116,41 +237,36 @@ void draw_switcher() {
     int pw = ww - px - 20;
     int ph = wh - py - 20;
 
-    XftDrawRect(switcher_draw, &dim, px, py, pw, ph);
-    XftDrawRect(switcher_draw, &bg, px + 2, py + 2, pw - 4, ph - 4);
+    XftDrawRect(switcher_buffer_draw, &s_dim, px, py, pw, ph);
+    XftDrawRect(switcher_buffer_draw, &s_bg, px + 2, py + 2, pw - 4, ph - 4);
     
     if (switcher_count > 0 && switcher_selected < switcher_count) {
         char *name = switcher_items[switcher_selected].name;
         int ws = switcher_items[switcher_selected].workspace;
         
-        XftDrawStringUtf8(switcher_draw, &sel_bg, switcher_font, px + 20, py + 40, (FcChar8 *)"Preview", 7);
-        XftDrawRect(switcher_draw, &dim, px + 20, py + 50, pw - 40, 1);
+        XftDrawStringUtf8(switcher_buffer_draw, &s_sel_bg, switcher_font, px + 20, py + 40, (FcChar8 *)"Preview", 7);
+        XftDrawRect(switcher_buffer_draw, &s_dim, px + 20, py + 50, pw - 40, 1);
         
         char truncated[64];
         strncpy(truncated, name, 63);
         truncated[63] = '\0';
-        XftDrawStringUtf8(switcher_draw, &fg, switcher_font, px + 20, py + 85, (FcChar8 *)truncated, strlen(truncated));
+        XftDrawStringUtf8(switcher_buffer_draw, &s_fg, switcher_font, px + 20, py + 85, (FcChar8 *)truncated, strlen(truncated));
         
         char ws_text[32];
         snprintf(ws_text, sizeof(ws_text), "On Workspace %d", ws + 1);
-        XftDrawStringUtf8(switcher_draw, &dim, switcher_font, px + 20, py + 120, (FcChar8 *)ws_text, strlen(ws_text));
+        XftDrawStringUtf8(switcher_buffer_draw, &s_dim, switcher_font, px + 20, py + 120, (FcChar8 *)ws_text, strlen(ws_text));
 
         // Window mockup
         int mx = px + 30;
         int my = py + 160;
         int mw = pw - 60;
         int mh = ph - 180;
-        XftDrawRect(switcher_draw, &dim, mx, my, mw, mh);
-        XftDrawRect(switcher_draw, &bg, mx + 1, my + 1, mw - 2, mh - 2);
-        XftDrawRect(switcher_draw, &sel_bg, mx + 1, my + 1, mw - 2, 20);
+        XftDrawRect(switcher_buffer_draw, &s_dim, mx, my, mw, mh);
+        XftDrawRect(switcher_buffer_draw, &s_bg, mx + 1, my + 1, mw - 2, mh - 2);
+        XftDrawRect(switcher_buffer_draw, &s_sel_bg, mx + 1, my + 1, mw - 2, 20);
     }
 
-    XftColorFree(dpy, switcher_visual, switcher_cmap, &bg);
-    XftColorFree(dpy, switcher_visual, switcher_cmap, &fg);
-    XftColorFree(dpy, switcher_visual, switcher_cmap, &sel_bg);
-    XftColorFree(dpy, switcher_visual, switcher_cmap, &sel_fg);
-    XftColorFree(dpy, switcher_visual, switcher_cmap, &dim);
-    XftColorFree(dpy, switcher_visual, switcher_cmap, &border);
+    XCopyArea(dpy, switcher_buffer, switcher_win, DefaultGC(dpy, DefaultScreen(dpy)), 0, 0, ww, wh, 0, 0);
 }
 
 void update_switcher_items() {
@@ -158,37 +274,22 @@ void update_switcher_items() {
     switcher_items = NULL;
     switcher_count = 0;
 
-    // Use focus stack for MRU order
     switcher_items = malloc(sizeof(SwitcherItem) * focus_stack_count);
     for (int i = 0; i < focus_stack_count; i++) {
         Window w = focus_stack[i];
-        XWindowAttributes wa;
-        if (!XGetWindowAttributes(dpy, w, &wa)) continue;
-        if (wa.map_state != IsViewable) continue;
+        Client *c = find_client(w);
+        if (!c) continue;
 
-        Atom actual_type;
-        int actual_format;
-        unsigned long nitems, bytes_after;
-        unsigned char *prop = NULL;
-        int ws = -1;
-        if (XGetWindowProperty(dpy, w, XInternAtom(dpy, "_NET_WM_DESKTOP", False),
-                               0, 1, False, XA_CARDINAL, &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success && prop) {
-            if (nitems > 0) ws = *(unsigned long *)prop;
-            XFree(prop);
+        char *name;
+        if (XFetchName(dpy, w, &name) && name) {
+            strncpy(switcher_items[switcher_count].name, name, 255);
+            XFree(name);
+        } else {
+            strcpy(switcher_items[switcher_count].name, "Unnamed Window");
         }
-        
-        if (ws != -1) {
-            char *name;
-            if (XFetchName(dpy, w, &name) && name) {
-                strncpy(switcher_items[switcher_count].name, name, 255);
-                XFree(name);
-            } else {
-                strcpy(switcher_items[switcher_count].name, "Unnamed Window");
-            }
-            switcher_items[switcher_count].win = w;
-            switcher_items[switcher_count].workspace = ws;
-            switcher_count++;
-        }
+        switcher_items[switcher_count].win = w;
+        switcher_items[switcher_count].workspace = c->ws;
+        switcher_count++;
     }
 }
 
@@ -223,9 +324,12 @@ void start_switching() {
         if (!switcher_font) switcher_font = XftFontOpenName(dpy, DefaultScreen(dpy), "fixed");
     }
 
-    switcher_draw = XftDrawCreate(dpy, switcher_win, switcher_visual, switcher_cmap);
-    XMapRaised(dpy, switcher_win);
+    alloc_switcher_colors();
     
+    switcher_buffer = XCreatePixmap(dpy, switcher_win, ww, wh, DefaultDepth(dpy, DefaultScreen(dpy)));
+    switcher_buffer_draw = XftDrawCreate(dpy, switcher_buffer, switcher_visual, switcher_cmap);
+
+    XMapRaised(dpy, switcher_win);
     XGrabKeyboard(dpy, switcher_win, True, GrabModeAsync, GrabModeAsync, CurrentTime);
     draw_switcher();
 }
@@ -247,10 +351,13 @@ void stop_switching() {
         set_focus(w);
     }
 
-    if (switcher_draw) XftDrawDestroy(switcher_draw);
+    if (switcher_buffer_draw) XftDrawDestroy(switcher_buffer_draw);
+    if (switcher_buffer) XFreePixmap(dpy, switcher_buffer);
     XDestroyWindow(dpy, switcher_win);
     switcher_win = 0;
-    switcher_draw = NULL;
+    switcher_buffer = 0;
+    switcher_buffer_draw = NULL;
+    free_switcher_colors();
 }
 
 void update_workspace_hints() {
@@ -265,126 +372,97 @@ void update_workspace_hints() {
     XChangeProperty(dpy, root, layout_atom, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&layout, 1);
 }
 
-int is_dock(Window w) {
-    Atom actual_type;
-    int actual_format;
-    unsigned long nitems, bytes_after;
-    unsigned char *prop = NULL;
-    Atom dock = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DOCK", False);
-    Atom type_atom = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
-    int dock_found = 0;
-    
-    if (XGetWindowProperty(dpy, w, type_atom, 0, 1, False, XA_ATOM,
-                           &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success && prop) {
-        if (nitems > 0 && *(Atom *)prop == dock) dock_found = 1;
-        XFree(prop);
-    }
-    return dock_found;
-}
-
 void raise_docks() {
-    unsigned int n;
-    Window root_return, parent_return, *children;
-    XQueryTree(dpy, root, &root_return, &parent_return, &children, &n);
-    for (unsigned int i = 0; i < n; i++) {
-        if (is_dock(children[i])) {
-            XRaiseWindow(dpy, children[i]);
+    for (Client *c = clients; c; c = c->next) {
+        if (c->is_dock) {
+            XRaiseWindow(dpy, c->win);
         }
     }
-    if (children) XFree(children);
 }
 
 void tile_windows(int ws) {
     if (layout_modes[ws] == 0) return;
 
-    unsigned int n;
-    Window root_return, parent_return, *children;
-    XQueryTree(dpy, root, &root_return, &parent_return, &children, &n);
-
     int count = 0;
-    Window *ws_windows = malloc(sizeof(Window) * n);
-    for (unsigned int i = 0; i < n; i++) {
-        XWindowAttributes wa;
-        XGetWindowAttributes(dpy, children[i], &wa);
-        if (wa.override_redirect || is_dock(children[i])) continue;
-        
-        Atom actual_type;
-        int actual_format;
-        unsigned long nitems, bytes_after;
-        unsigned char *prop = NULL;
-        int win_ws = -1;
-        if (XGetWindowProperty(dpy, children[i], XInternAtom(dpy, "_NET_WM_DESKTOP", False),
-                               0, 1, False, XA_CARDINAL, &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success && prop) {
-            if (nitems > 0) win_ws = *(unsigned long *)prop;
-            XFree(prop);
-        }
-        if (win_ws == ws) {
-            ws_windows[count++] = children[i];
+    for (Client *c = clients; c; c = c->next) {
+        if (!c->is_dock && !c->is_floating && c->ws == ws) {
+            XWindowAttributes wa;
+            if (XGetWindowAttributes(dpy, c->win, &wa) && wa.map_state == IsViewable)
+                count++;
         }
     }
 
     if (count > 0) {
-        int screen = DefaultScreen(dpy);
-        int sw = DisplayWidth(dpy, screen);
-        int sh = DisplayHeight(dpy, screen);
-        int wy = config_bar_height;
+        int sx = 0, sy = 0, sw, sh;
+        int n;
+        XineramaScreenInfo *info = NULL;
+        if (XineramaIsActive(dpy) && (info = XineramaQueryScreens(dpy, &n))) {
+            sx = info[0].x_org;
+            sy = info[0].y_org;
+            sw = info[0].width;
+            sh = info[0].height;
+            XFree(info);
+        } else {
+            int screen = DefaultScreen(dpy);
+            sw = DisplayWidth(dpy, screen);
+            sh = DisplayHeight(dpy, screen);
+        }
+
+        int wy = sy + config_bar_height;
         int wh = sh - config_bar_height;
         int bw = config_border_width;
+        int gap = (config_wm_type == 1) ? 10 : 0;
 
-        if (count == 1) {
-            XMoveResizeWindow(dpy, ws_windows[0], 0, wy, sw - 2*bw, wh - 2*bw);
-        } else {
+        Client *ws_clients[count];
+        int real_count = 0;
+        for (Client *c = clients; c; c = c->next) {
+            if (!c->is_dock && !c->is_floating && c->ws == ws) {
+                XWindowAttributes wa;
+                if (XGetWindowAttributes(dpy, c->win, &wa) && wa.map_state == IsViewable) {
+                    if (real_count < count) ws_clients[real_count++] = c;
+                }
+            }
+        }
+
+        if (real_count == 1) {
+            XMoveResizeWindow(dpy, ws_clients[0]->win, sx + gap, wy + gap, sw - 2*bw - 2*gap, wh - 2*bw - 2*gap);
+        } else if (real_count > 1) {
             int master_w = sw / 2;
-            XMoveResizeWindow(dpy, ws_windows[0], 0, wy, master_w - 2*bw, wh - 2*bw);
+            XMoveResizeWindow(dpy, ws_clients[0]->win, sx + gap, wy + gap, master_w - 2*bw - 2*gap, wh - 2*bw - 2*gap);
 
             int stack_w = sw - master_w;
-            int stack_h = wh / (count - 1);
-            for (int i = 1; i < count; i++) {
-                XMoveResizeWindow(dpy, ws_windows[i], master_w, wy + (i - 1) * stack_h, stack_w - 2*bw, stack_h - 2*bw);
+            int stack_h = wh / (real_count - 1);
+            for (int i = 1; i < real_count; i++) {
+                XMoveResizeWindow(dpy, ws_clients[i]->win, sx + master_w + gap, wy + (i - 1) * stack_h + gap, stack_w - 2*bw - 2*gap, stack_h - 2*bw - 2*gap);
             }
         }
     }
-    free(ws_windows);
-    if (children) XFree(children);
 }
 
 void set_focus(Window w) {
     if (focused_win && focused_win != root) {
         XSetWindowBorder(dpy, focused_win, config_unfocused_color);
     }
-    if (w && w != root && !is_dock(w)) {
-        XSetWindowBorder(dpy, w, config_focused_color);
-        XSetInputFocus(dpy, w, RevertToParent, CurrentTime);
-        XRaiseWindow(dpy, w);
-        raise_docks();
-        last_focused[current_workspace] = w;
-        add_to_stack(w);
+    if (w && w != root) {
+        Client *c = find_client(w);
+        if (c && !c->is_dock) {
+            XSetWindowBorder(dpy, w, config_focused_color);
+            XSetInputFocus(dpy, w, RevertToParent, CurrentTime);
+            XRaiseWindow(dpy, w);
+            raise_docks();
+            last_focused[current_workspace] = w;
+            add_to_stack(w);
+        }
     }
     focused_win = w;
 }
 
 void show_hide_windows() {
-    unsigned int n;
-    Window root_return, parent_return, *children;
-    XQueryTree(dpy, root, &root_return, &parent_return, &children, &n);
-    for (unsigned int i = 0; i < n; i++) {
-        Atom actual_type;
-        int actual_format;
-        unsigned long nitems, bytes_after;
-        unsigned char *prop = NULL;
-        int ws = -1;
-        if (XGetWindowProperty(dpy, children[i], XInternAtom(dpy, "_NET_WM_DESKTOP", False),
-                               0, 1, False, XA_CARDINAL, &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success && prop) {
-            if (nitems > 0) ws = *(unsigned long *)prop;
-            XFree(prop);
-        }
-        
-        if (ws != -1) {
-            if (ws == current_workspace) XMapWindow(dpy, children[i]);
-            else XUnmapWindow(dpy, children[i]);
-        }
+    for (Client *c = clients; c; c = c->next) {
+        if (c->is_dock) continue;
+        if (c->ws == current_workspace) XMapWindow(dpy, c->win);
+        else XUnmapWindow(dpy, c->win);
     }
-    if (children) XFree(children);
 
     if (last_focused[current_workspace]) {
         set_focus(last_focused[current_workspace]);
@@ -409,6 +487,10 @@ void grab_keys() {
     
     // Alt+Tab
     XGrabKey(dpy, XKeysymToKeycode(dpy, XStringToKeysym("Tab")), Mod1Mask, root, True, GrabModeAsync, GrabModeAsync);
+
+    // Layout/Floating toggle
+    XGrabKey(dpy, XKeysymToKeycode(dpy, XStringToKeysym("f")), config_modifier, root, True, GrabModeAsync, GrabModeAsync);
+    XGrabKey(dpy, XKeysymToKeycode(dpy, XStringToKeysym("f")), config_modifier | ShiftMask, root, True, GrabModeAsync, GrabModeAsync);
 }
 
 void grab_buttons() {
@@ -419,7 +501,6 @@ void grab_buttons() {
 int xerror(Display *dpy, XErrorEvent *ee) {
     (void)dpy;
     (void)ee;
-    // Ignore X errors to prevent the WM from crashing
     return 0;
 }
 
@@ -430,6 +511,10 @@ int main() {
     start.subwindow = None;
 
     load_config();
+
+    for (int i = 0; i < 9; i++) {
+        layout_modes[i] = (config_wm_type == 1) ? 0 : 1;
+    }
 
     if (config_wallpaper[0] != '\0') {
         if (fork() == 0) {
@@ -452,16 +537,12 @@ int main() {
     grab_buttons();
     update_workspace_hints();
 
-    // Initialize focus stack
+    // Initialize clients
     unsigned int n;
     Window root_return, parent_return, *children;
     if (XQueryTree(dpy, root, &root_return, &parent_return, &children, &n)) {
         for (unsigned int i = 0; i < n; i++) {
-            XWindowAttributes wa;
-            XGetWindowAttributes(dpy, children[i], &wa);
-            if (!wa.override_redirect && !is_dock(children[i]) && wa.map_state == IsViewable) {
-                add_to_stack(children[i]);
-            }
+            add_client(children[i]);
         }
         if (children) XFree(children);
     }
@@ -479,32 +560,25 @@ int main() {
     while (running && !XNextEvent(dpy, &ev)) {
         if (ev.type == MapRequest) {
             Window w = ev.xmaprequest.window;
-            XSelectInput(dpy, w, EnterWindowMask);
-            
-            XWindowAttributes wa;
-            XGetWindowAttributes(dpy, w, &wa);
-            
-            if (!is_dock(w)) {
-                if (wa.y < config_bar_height) {
-                    XMoveWindow(dpy, w, wa.x, config_bar_height);
+            add_client(w);
+            Client *c = find_client(w);
+            if (c) {
+                XSelectInput(dpy, w, EnterWindowMask);
+                if (!c->is_dock && c->y < config_bar_height) {
+                    c->y = config_bar_height;
+                    XMoveWindow(dpy, w, c->x, c->y);
                 }
+                XMapWindow(dpy, w);
+                XSetWindowBorderWidth(dpy, w, config_border_width);
+                set_focus(w);
+                tile_windows(current_workspace);
             }
-
-            XMapWindow(dpy, w);
-            XSetWindowBorderWidth(dpy, w, config_border_width);
-            
-            // Set workspace for new window
-            unsigned long ws = current_workspace;
-            XChangeProperty(dpy, w, XInternAtom(dpy, "_NET_WM_DESKTOP", False), XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&ws, 1);
-            
-            set_focus(w);
-            tile_windows(current_workspace);
         } else if (ev.type == EnterNotify) {
             if (ev.xcrossing.window != root) {
                 set_focus(ev.xcrossing.window);
             }
         } else if (ev.type == DestroyNotify) {
-            remove_from_stack(ev.xdestroywindow.window);
+            remove_client(ev.xdestroywindow.window);
             if (ev.xdestroywindow.window == focused_win) {
                 focused_win = 0;
             }
@@ -513,6 +587,8 @@ int main() {
                     last_focused[i] = 0;
                 }
             }
+            tile_windows(current_workspace);
+        } else if (ev.type == UnmapNotify) {
             tile_windows(current_workspace);
         } else if (ev.type == ConfigureRequest) {
             XWindowChanges wc;
@@ -524,6 +600,12 @@ int main() {
             wc.sibling = ev.xconfigurerequest.above;
             wc.stack_mode = ev.xconfigurerequest.detail;
             XConfigureWindow(dpy, ev.xconfigurerequest.window, ev.xconfigurerequest.value_mask, &wc);
+            
+            Client *c = find_client(ev.xconfigurerequest.window);
+            if (c) {
+                c->x = wc.x; c->y = wc.y; c->w = wc.width; c->h = wc.height;
+                if (layout_modes[c->ws]) tile_windows(c->ws);
+            }
         } else if (ev.type == KeyPress) {
             KeySym keysym = XkbKeycodeToKeysym(dpy, ev.xkey.keycode, 0, 0);
             if (keysym == XStringToKeysym("Return")) {
@@ -553,19 +635,36 @@ int main() {
             } else if (keysym >= XK_1 && keysym <= XK_9) {
                 int ws = keysym - XK_1;
                 if (ev.xkey.state & ShiftMask) {
-                    // Move focused window to workspace
                     if (focused_win && focused_win != root) {
-                        unsigned long wsv = ws;
-                        XChangeProperty(dpy, focused_win, XInternAtom(dpy, "_NET_WM_DESKTOP", False), XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&wsv, 1);
-                        XUnmapWindow(dpy, focused_win);
-                        tile_windows(current_workspace);
-                        tile_windows(ws);
+                        Client *c = find_client(focused_win);
+                        if (c) {
+                            c->ws = ws;
+                            unsigned long wsv = ws;
+                            XChangeProperty(dpy, focused_win, XInternAtom(dpy, "_NET_WM_DESKTOP", False), XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&wsv, 1);
+                            XUnmapWindow(dpy, focused_win);
+                            tile_windows(current_workspace);
+                            tile_windows(ws);
+                        }
                     }
                 } else {
-                    // Switch workspace
                     current_workspace = ws;
                     update_workspace_hints();
                     show_hide_windows();
+                    tile_windows(current_workspace);
+                }
+            } else if (keysym == XStringToKeysym("f")) {
+                if (ev.xkey.state & ShiftMask) {
+                    if (focused_win && focused_win != root) {
+                        Client *c = find_client(focused_win);
+                        if (c) {
+                            c->is_floating ^= 1;
+                            tile_windows(current_workspace);
+                        }
+                    }
+                } else {
+                    layout_modes[current_workspace] ^= 1;
+                    update_workspace_hints();
+                    tile_windows(current_workspace);
                 }
             } else if (keysym == XStringToKeysym("Tab") && (ev.xkey.state & Mod1Mask)) {
                 if (!is_switching) {
@@ -589,7 +688,9 @@ int main() {
         } else if (ev.type == ButtonPress) {
             if (ev.xbutton.subwindow != None) {
                 XGetWindowAttributes(dpy, ev.xbutton.subwindow, &attr);
-                if (attr.override_redirect || is_dock(ev.xbutton.subwindow)) continue;
+                if (attr.override_redirect) continue;
+                Client *c = find_client(ev.xbutton.subwindow);
+                if (c && c->is_dock) continue;
                 start = ev.xbutton;
                 set_focus(ev.xbutton.subwindow);
             }
@@ -611,8 +712,66 @@ int main() {
                 if (new_h < 1) new_h = 1;
 
                 XMoveResizeWindow(dpy, start.subwindow, new_x, new_y, new_w, new_h);
+                Client *c = find_client(start.subwindow);
+                if (c) {
+                    c->x = new_x; c->y = new_y; c->w = new_w; c->h = new_h;
+                }
             }
         } else if (ev.type == ButtonRelease) {
+            if (start.button == 1 && start.subwindow != None) {
+                Client *c = find_client(start.subwindow);
+                if (c && !c->is_floating && !c->is_dock && layout_modes[current_workspace]) {
+                    int mx = ev.xbutton.x_root;
+                    int my = ev.xbutton.y_root;
+                    Client *target = NULL;
+                    for (Client *t = clients; t; t = t->next) {
+                        if (t != c && t->ws == current_workspace && !t->is_floating && !t->is_dock) {
+                            if (mx >= t->x && mx <= t->x + t->w &&
+                                my >= t->y && my <= t->y + t->h) {
+                                target = t;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (target) {
+                        // Remove c from list
+                        if (c->prev) c->prev->next = c->next;
+                        if (c->next) c->next->prev = c->prev;
+                        if (c == clients) clients = c->next;
+
+                        // Find master to decide split logic
+                        Client *master = NULL;
+                        for (Client *t = clients; t; t = t->next) {
+                            if (t->ws == current_workspace && !t->is_floating && !t->is_dock) {
+                                master = t;
+                                break;
+                            }
+                        }
+
+                        int insert_after = 0;
+                        if (target == master) {
+                            if (mx > target->x + target->w / 2) insert_after = 1;
+                        } else {
+                            if (my > target->y + target->h / 2) insert_after = 1;
+                        }
+
+                        if (insert_after) {
+                            c->next = target->next;
+                            c->prev = target;
+                            if (target->next) target->next->prev = c;
+                            target->next = c;
+                        } else {
+                            c->next = target;
+                            c->prev = target->prev;
+                            if (target->prev) target->prev->next = c;
+                            else clients = c;
+                            target->prev = c;
+                        }
+                    }
+                    tile_windows(current_workspace);
+                }
+            }
             start.subwindow = None;
         } else if (ev.type == ClientMessage) {
             if (ev.xclient.message_type == XInternAtom(dpy, "_NET_CURRENT_DESKTOP", False)) {
@@ -624,11 +783,15 @@ int main() {
             } else if (ev.xclient.message_type == XInternAtom(dpy, "_NET_WM_DESKTOP", False)) {
                 int ws = ev.xclient.data.l[0];
                 if (ws >= 0 && ws < 9) {
-                    XChangeProperty(dpy, ev.xclient.window, XInternAtom(dpy, "_NET_WM_DESKTOP", False), XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&ws, 1);
-                    if (ws != current_workspace) XUnmapWindow(dpy, ev.xclient.window);
-                    else XMapWindow(dpy, ev.xclient.window);
-                    tile_windows(ws);
-                    tile_windows(current_workspace);
+                    Client *c = find_client(ev.xclient.window);
+                    if (c) {
+                        c->ws = ws;
+                        XChangeProperty(dpy, ev.xclient.window, XInternAtom(dpy, "_NET_WM_DESKTOP", False), XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&ws, 1);
+                        if (ws != current_workspace) XUnmapWindow(dpy, ev.xclient.window);
+                        else XMapWindow(dpy, ev.xclient.window);
+                        tile_windows(ws);
+                        tile_windows(current_workspace);
+                    }
                 }
             } else if (ev.xclient.message_type == XInternAtom(dpy, "_NEBULA_TOGGLE_LAYOUT", False)) {
                 layout_modes[current_workspace] ^= 1;

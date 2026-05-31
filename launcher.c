@@ -52,10 +52,28 @@ static int  selected = 0;
 static int  scroll_off = 0;
 
 /* ── Helpers ────────────────────────────────────────────────── */
-static XftColor xft_color(const char *hex) {
-    XftColor c;
-    XftColorAllocName(dpy, visual, cmap, hex, &c);
-    return c;
+static Pixmap buf;
+static XftColor s_bg, s_input_bg, s_prompt, s_fg, s_dim, s_sel_bg, s_sel_fg;
+
+static void alloc_colors(void) {
+    Theme t = load_theme();
+    XftColorAllocName(dpy, visual, cmap, t.bg, &s_bg);
+    XftColorAllocName(dpy, visual, cmap, t.input_bg, &s_input_bg);
+    XftColorAllocName(dpy, visual, cmap, t.prompt, &s_prompt);
+    XftColorAllocName(dpy, visual, cmap, t.fg, &s_fg);
+    XftColorAllocName(dpy, visual, cmap, t.dim, &s_dim);
+    XftColorAllocName(dpy, visual, cmap, t.sel_bg, &s_sel_bg);
+    XftColorAllocName(dpy, visual, cmap, t.sel_fg, &s_sel_fg);
+}
+
+static void free_colors(void) {
+    XftColorFree(dpy, visual, cmap, &s_bg);
+    XftColorFree(dpy, visual, cmap, &s_input_bg);
+    XftColorFree(dpy, visual, cmap, &s_prompt);
+    XftColorFree(dpy, visual, cmap, &s_fg);
+    XftColorFree(dpy, visual, cmap, &s_dim);
+    XftColorFree(dpy, visual, cmap, &s_sel_bg);
+    XftColorFree(dpy, visual, cmap, &s_sel_fg);
 }
 
 static void str_tolower(char *dst, const char *src, int n) {
@@ -165,22 +183,17 @@ static void filter_apps(void) {
     if (selected < 0) selected = 0;
 }
 
-/* ── Draw ───────────────────────────────────────────────────── */
 static void draw(void) {
     int w = WIN_W, h = WIN_H;
-    Theme t = load_theme();
 
     /* background */
-    XftColor bg = xft_color(t.bg);
-    XftDrawRect(xft_draw, &bg, 0, 0, w, h);
+    XftDrawRect(xft_draw, &s_bg, 0, 0, w, h);
 
     /* input box background */
-    XftColor input_bg = xft_color(t.input_bg);
-    XftDrawRect(xft_draw, &input_bg, PAD_X, PAD_Y, w - 2 * PAD_X, INPUT_H);
+    XftDrawRect(xft_draw, &s_input_bg, PAD_X, PAD_Y, w - 2 * PAD_X, INPUT_H);
 
     /* prompt */
-    XftColor prompt_col = xft_color(t.prompt);
-    XftDrawStringUtf8(xft_draw, &prompt_col, font,
+    XftDrawStringUtf8(xft_draw, &s_prompt, font,
                       PAD_X + 12, PAD_Y + INPUT_H / 2 + font->ascent / 2,
                       (FcChar8 *)PROMPT, strlen(PROMPT));
 
@@ -189,9 +202,8 @@ static void draw(void) {
     XftTextExtentsUtf8(dpy, font, (FcChar8 *)PROMPT, strlen(PROMPT), &ext);
     int qx = PAD_X + 12 + ext.xOff + 4;
 
-    XftColor fg = xft_color(t.fg);
     if (query_len > 0) {
-        XftDrawStringUtf8(xft_draw, &fg, font,
+        XftDrawStringUtf8(xft_draw, &s_fg, font,
                           qx, PAD_Y + INPUT_H / 2 + font->ascent / 2,
                           (FcChar8 *)query, query_len);
         /* cursor after text */
@@ -199,47 +211,42 @@ static void draw(void) {
         qx += ext.xOff;
     }
 
-    /* blinking cursor (always shown for simplicity) */
-    XftDrawRect(xft_draw, &fg, qx, PAD_Y + 10, 2, INPUT_H - 20);
+    /* blinking cursor */
+    XftDrawRect(xft_draw, &s_fg, qx, PAD_Y + 10, 2, INPUT_H - 20);
 
     /* separator line */
-    XftColor dim = xft_color(t.dim);
-    XftDrawRect(xft_draw, &dim, PAD_X, PAD_Y + INPUT_H + 6, w - 2 * PAD_X, 1);
+    XftDrawRect(xft_draw, &s_dim, PAD_X, PAD_Y + INPUT_H + 6, w - 2 * PAD_X, 1);
 
     /* items */
     int list_y = PAD_Y + INPUT_H + 14;
     int max_visible = (h - list_y - PAD_Y) / ITEM_H;
     if (max_visible < 0) max_visible = 0;
 
-    /* adjust scroll so selected is visible */
     if (filtered_count > 0) {
         if (selected < scroll_off) scroll_off = selected;
         if (max_visible > 0 && selected >= scroll_off + max_visible)
             scroll_off = selected - max_visible + 1;
     }
 
-    XftColor sel_bg   = xft_color(t.sel_bg);
-    XftColor sel_fg_c = xft_color(t.sel_fg);
-
     for (int i = 0; i < max_visible && i + scroll_off < filtered_count; i++) {
         int idx = i + scroll_off;
         int iy = list_y + i * ITEM_H;
 
         if (idx == selected) {
-            XftDrawRect(xft_draw, &sel_bg, PAD_X, iy, w - 2 * PAD_X, ITEM_H);
-            XftDrawStringUtf8(xft_draw, &sel_fg_c, font,
+            XftDrawRect(xft_draw, &s_sel_bg, PAD_X, iy, w - 2 * PAD_X, ITEM_H);
+            XftDrawStringUtf8(xft_draw, &s_sel_fg, font,
                               PAD_X + 14, iy + ITEM_H / 2 + font->ascent / 2,
                               (FcChar8 *)filtered[idx]->name,
                               strlen(filtered[idx]->name));
         } else {
-            XftDrawStringUtf8(xft_draw, &fg, font,
+            XftDrawStringUtf8(xft_draw, &s_fg, font,
                               PAD_X + 14, iy + ITEM_H / 2 + font->ascent / 2,
                               (FcChar8 *)filtered[idx]->name,
                               strlen(filtered[idx]->name));
         }
     }
 
-    /* scrollbar (if needed) */
+    /* scrollbar */
     if (filtered_count > max_visible && max_visible > 0) {
         int denom = filtered_count - max_visible;
         int bar_h = (max_visible * (h - list_y - PAD_Y)) / filtered_count;
@@ -247,26 +254,19 @@ static void draw(void) {
         int bar_y = list_y;
         if (denom > 0)
             bar_y += (scroll_off * (h - list_y - PAD_Y - bar_h)) / denom;
-        XftDrawRect(xft_draw, &dim, w - PAD_X - 4, bar_y, 3, bar_h);
+        XftDrawRect(xft_draw, &s_dim, w - PAD_X - 4, bar_y, 3, bar_h);
     }
 
     /* count indicator */
     char count[32];
     snprintf(count, sizeof(count), "%d/%d", filtered_count, app_count);
     XftTextExtentsUtf8(dpy, font, (FcChar8 *)count, strlen(count), &ext);
-    XftDrawStringUtf8(xft_draw, &dim, font,
+    XftDrawStringUtf8(xft_draw, &s_dim, font,
                       w - PAD_X - ext.xOff - 8,
                       PAD_Y + INPUT_H / 2 + font->ascent / 2,
                       (FcChar8 *)count, strlen(count));
-
-    /* free allocated XftColors to prevent X resource leaks */
-    XftColorFree(dpy, visual, cmap, &bg);
-    XftColorFree(dpy, visual, cmap, &input_bg);
-    XftColorFree(dpy, visual, cmap, &prompt_col);
-    XftColorFree(dpy, visual, cmap, &fg);
-    XftColorFree(dpy, visual, cmap, &dim);
-    XftColorFree(dpy, visual, cmap, &sel_bg);
-    XftColorFree(dpy, visual, cmap, &sel_fg_c);
+    
+    XCopyArea(dpy, buf, win, gc, 0, 0, w, h, 0, 0);
 }
 
 /* ── Launch ─────────────────────────────────────────────────── */
@@ -338,7 +338,9 @@ int main(void) {
     }
 
     gc = XCreateGC(dpy, win, 0, NULL);
-    xft_draw = XftDrawCreate(dpy, win, visual, cmap);
+    buf = XCreatePixmap(dpy, win, WIN_W, WIN_H, DefaultDepth(dpy, screen));
+    xft_draw = XftDrawCreate(dpy, buf, visual, cmap);
+    alloc_colors();
 
     XMapRaised(dpy, win);
     XSetInputFocus(dpy, win, RevertToParent, CurrentTime);
@@ -420,7 +422,9 @@ int main(void) {
     }
 
     XUngrabKeyboard(dpy, CurrentTime);
+    free_colors();
     XftDrawDestroy(xft_draw);
+    XFreePixmap(dpy, buf);
     XftFontClose(dpy, font);
     XFreeGC(dpy, gc);
     XDestroyWindow(dpy, win);

@@ -14,12 +14,14 @@ POWERMENU = nebula-powermenu
 LOCKSCREEN = nebula-lockscreen
 BAR = nebula-bar
 STARLIGHT = starlight
+COMPOSITOR = nebula-compositor
+COMP_LIBS = -lXcomposite -lXdamage -lXfixes -lXrender -lXext -lGL
 
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 XSESSIONSDIR ?= /usr/share/xsessions
 
-all: $(EXEC) $(LAUNCHER) $(POWERMENU) $(LOCKSCREEN) $(BAR) $(STARLIGHT)
+all: $(EXEC) $(LAUNCHER) $(POWERMENU) $(LOCKSCREEN) $(BAR) $(STARLIGHT) $(COMPOSITOR)
 
 $(EXEC): $(OBJ)
 	$(CC) $(OBJ) $(LIBS) $(XFT_LIBS) -o $(EXEC)
@@ -39,11 +41,14 @@ $(BAR): bar.c
 $(STARLIGHT): starlight.c
 	$(CC) $(CFLAGS) $(XFT_CFLAGS) starlight.c $(XFT_LIBS) -lutil -o $(STARLIGHT)
 
+$(COMPOSITOR): compositor.c
+	$(CC) $(CFLAGS) compositor.c -o $(COMPOSITOR) $(LIBS) $(COMP_LIBS)
+
 %.o: %.c
 	$(CC) $(CFLAGS) $(XFT_CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OBJ) $(EXEC) $(LAUNCHER) $(POWERMENU) $(LOCKSCREEN) $(BAR) $(STARLIGHT)
+	rm -f $(OBJ) $(EXEC) $(LAUNCHER) $(POWERMENU) $(LOCKSCREEN) $(BAR) $(STARLIGHT) $(COMPOSITOR)
 
 install: all
 	install -d $(DESTDIR)$(BINDIR)
@@ -53,6 +58,7 @@ install: all
 	install -m 755 $(LOCKSCREEN) $(DESTDIR)$(BINDIR)/$(LOCKSCREEN)
 	install -m 755 $(BAR) $(DESTDIR)$(BINDIR)/$(BAR)
 	install -m 755 $(STARLIGHT) $(DESTDIR)$(BINDIR)/$(STARLIGHT)
+	install -m 755 $(COMPOSITOR) $(DESTDIR)$(BINDIR)/$(COMPOSITOR)
 	install -d $(DESTDIR)$(XSESSIONSDIR)
 	install -m 644 nebulawm.desktop $(DESTDIR)$(XSESSIONSDIR)/nebulawm.desktop
 	@if [ -n "$$SUDO_USER" ]; then \
@@ -88,4 +94,5 @@ uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(LOCKSCREEN)
 	rm -f $(DESTDIR)$(BINDIR)/$(BAR)
 	rm -f $(DESTDIR)$(BINDIR)/$(STARLIGHT)
+	rm -f $(DESTDIR)$(BINDIR)/$(COMPOSITOR)
 	rm -f $(DESTDIR)$(XSESSIONSDIR)/nebulawm.desktop

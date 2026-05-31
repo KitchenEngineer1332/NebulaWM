@@ -7,9 +7,11 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <pwd.h>
+#include <ctype.h>
 
 int config_border_width = 2;
 int config_bar_height = 30;
+int config_wm_type = 0; // 0 for nogaps, 1 for float
 unsigned long config_focused_color = 0x7aa2f7;
 unsigned long config_unfocused_color = 0x414868;
 char config_terminal[256] = "starlight";
@@ -44,6 +46,7 @@ void load_config(void) {
         f = fopen(path, "w");
         if (f) {
             fprintf(f, "border_width=2\n");
+            fprintf(f, "wmtype=nogaps\n");
             fprintf(f, "primary_color=#ff0055\n");
             fprintf(f, "terminal=starlight\n");
             fprintf(f, "modifier=Mod4\n");
@@ -56,13 +59,29 @@ void load_config(void) {
 
     char line[256];
     while (fgets(line, sizeof(line), f)) {
-        char *key = strtok(line, "=");
-        char *val = strtok(NULL, "\n");
-        if (key && val) {
-            val[strcspn(val, "\r\n")] = 0;
-            
+        char *delimiter = strpbrk(line, "=:");
+        if (!delimiter) continue;
+
+        *delimiter = '\0';
+        char *key = line;
+        char *val = delimiter + 1;
+
+        // Trim whitespace from key
+        while (*key && isspace(*key)) key++;
+        char *end = key + strlen(key) - 1;
+        while (end > key && isspace(*end)) *end-- = '\0';
+
+        // Trim whitespace from val
+        while (*val && isspace(*val)) val++;
+        end = val + strlen(val) - 1;
+        while (end > val && isspace(*end)) *end-- = '\0';
+
+        if (*key && *val) {
             if (strcmp(key, "border_width") == 0) {
                 config_border_width = atoi(val);
+            } else if (strcmp(key, "wmtype") == 0) {
+                if (strcmp(val, "nogaps") == 0) config_wm_type = 0;
+                else if (strcmp(val, "float") == 0) config_wm_type = 1;
             } else if (strcmp(key, "bar_height") == 0) {
                 config_bar_height = atoi(val);
             } else if (strcmp(key, "terminal") == 0) {

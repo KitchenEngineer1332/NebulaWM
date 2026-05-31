@@ -29,7 +29,7 @@
 
 enum { ATTR_BOLD=1, ATTR_UNDERLINE=2, ATTR_REVERSE=4 };
 
-typedef struct { char ch[4]; uint8_t len; uint8_t fg, bg, attr; } Cell;
+typedef struct { char ch[4]; uint8_t len; uint16_t fg, bg; uint8_t attr; } Cell;
 
 static Display *dpy;
 static int scr;
@@ -62,12 +62,15 @@ static Cell *scroll_buf;
 static int scroll_lines = 0;
 static int scroll_off = 0;
 
-static XftColor colors[18]; /* 0-15 ansi, 16=fg, 17=bg */
-static int cur_fg = 16, cur_bg = 17, cur_attr = 0;
+static Cell *prev_buf = NULL;
+static int force_full_redraw = 1;
+
+static XftColor colors[258]; /* 0-255 ansi, 256=fg, 257=bg */
+static int cur_fg = 256, cur_bg = 257, cur_attr = 0;
 
 static char esc_buf[MAX_ESC];
 static int esc_len = 0;
-static int esc_state = 0; /* 0=normal, 1=ESC, 2=CSI, 3=OSC */
+static int esc_state = 0; /* 0=normal, 1=ESC, 2=CSI, 3=OSC, 5=charset */
 
 static int running = 1;
 static int dirty = 1;
@@ -77,7 +80,7 @@ static void init_colors(void) {
     unsigned long p = 0;
     if (t.border[0]=='#') p = strtoul(t.border+1,NULL,16);
     unsigned long bk = 0x101014;
-    char hex[10];
+    char hex[16];
     /* ANSI 0-7: dark variants */
     blend_color(p, bk, 0.10f, hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[0]);
     blend_color(0xf7768e, bk, 0.85f, hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[1]);
@@ -96,18 +99,106 @@ static void init_colors(void) {
     blend_color(0xbb9af7, 0xffffff, 0.90f, hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[13]);
     blend_color(0x7dcfff, 0xffffff, 0.90f, hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[14]);
     XftColorAllocName(dpy,vis,cmap,"#c0caf5",&colors[15]);
-    XftColorAllocName(dpy,vis,cmap,t.fg,&colors[16]);
-    XftColorAllocName(dpy,vis,cmap,t.bg,&colors[17]);
+
+    /* 16-231: 6x6x6 color cube */
+    for (int r = 0; r < 6; r++) {
+        for (int g = 0; g < 6; g++) {
+            for (int b = 0; b < 6; b++) {
+                int idx = 16 + r*36 + g*6 + b;
+                snprintf(hex, sizeof(hex), "#%02x%02x%02x", 
+                         r ? r*40 + 55 : 0, 
+                         g ? g*40 + 55 : 0, 
+                         b ? b*40 + 55 : 0);
+                XftColorAllocName(dpy,vis,cmap,hex,&colors[idx]);
+            }
+        }
+    }
+
+    /* 232-255: grayscale ramp */
+    for (int i = 0; i < 24; i++) {
+        int idx = 232 + i;
+        int val = 8 + i*10;
+        snprintf(hex, sizeof(hex), "#%02x%02x%02x", val, val, val);
+        XftColorAllocName(dpy,vis,cmap,hex,&colors[idx]);
+    }
+
+    XftColorAllocName(dpy,vis,cmap,t.fg,&colors[256]);
+    XftColorAllocName(dpy,vis,cmap,t.bg,&colors[257]);
+}
+
+static int match_color(int r, int g, int b) {
+    int best_idx = 0;
+    int min_dist = 10000000;
+    for (int i = 0; i < 256; i++) {
+        int cr, cg, cb;
+        if (i < 16) {
+            static const struct { uint8_t r, g, b; } ansi_colors[16] = {
+                {0,0,0}, {170,0,0}, {0,170,0}, {170,85,0}, {0,0,170}, {170,0,170}, {0,170,170}, {170,170,170},
+                {85,85,85}, {255,85,85}, {85,255,85}, {255,255,85}, {85,85,255}, {255,85,255}, {85,255,255}, {255,255,255}
+            };
+            cr = ansi_colors[i].r;
+            cg = ansi_colors[i].g;
+            cb = ansi_colors[i].b;
+        } else if (i < 232) {
+            int idx = i - 16;
+            int dr = idx / 36;
+            int dg = (idx % 36) / 6;
+            int db = idx % 6;
+            cr = dr ? dr*40 + 55 : 0;
+            cg = dg ? dg*40 + 55 : 0;
+            cb = db ? db*40 + 55 : 0;
+        } else {
+            cr = cg = cb = 8 + (i - 232)*10;
+        }
+        int dr = cr - r;
+        int dg = cg - g;
+        int db = cb - b;
+        int dist = dr*dr + dg*dg + db*db;
+        if (dist < min_dist) {
+            min_dist = dist;
+            best_idx = i;
+        }
+    }
+    return best_idx;
+}
+
+static int cells_equal(const Cell *c1, const Cell *c2) {
+    if (c1->len != c2->len) return 0;
+    if (c1->fg != c2->fg || c1->bg != c2->bg || c1->attr != c2->attr) return 0;
+    return memcmp(c1->ch, c2->ch, c1->len) == 0;
+}
+
+static Cell* cell_at(int x, int y) { return &screen_buf[y*cols+x]; }
+
+static Cell* get_cell_to_draw(int x, int y) {
+    static Cell b_cell;
+    b_cell.ch[0]=' '; b_cell.ch[1]=0; b_cell.ch[2]=0; b_cell.ch[3]=0;
+    b_cell.len=1; b_cell.fg=256; b_cell.bg=257; b_cell.attr=0;
+
+    if (scroll_off > 0) {
+        long abs_y = (long)scroll_lines - scroll_off + y;
+        if (abs_y < scroll_lines) {
+            if (abs_y >= 0 && abs_y >= (long)scroll_lines - SCROLLBACK) {
+                return &scroll_buf[(abs_y % SCROLLBACK)*cols + x];
+            } else {
+                return &b_cell;
+            }
+        } else {
+            int sy = abs_y - scroll_lines;
+            if (sy >= 0 && sy < rows) return cell_at(x, sy);
+            else return &b_cell;
+        }
+    } else {
+        return cell_at(x, y);
+    }
 }
 
 static Cell blank_cell(void) {
     Cell c;
     c.ch[0]=' '; c.ch[1]=0; c.ch[2]=0; c.ch[3]=0;
-    c.len=1; c.fg=(uint8_t)cur_fg; c.bg=(uint8_t)cur_bg; c.attr=0;
+    c.len=1; c.fg=cur_fg; c.bg=cur_bg; c.attr=0;
     return c;
 }
-
-static Cell* cell_at(int x, int y) { return &screen_buf[y*cols+x]; }
 
 static void clear_region(int x1,int y1,int x2,int y2) {
     Cell b = blank_cell();
@@ -172,51 +263,34 @@ static void put_char(const char *utf8, int len, int width) {
 }
 
 static void draw(void) {
-    XftDrawRect(xdraw, &colors[17], 0, 0, win_w, win_h);
-    Cell b_cell = blank_cell();
+    if (force_full_redraw) {
+        XftDrawRect(xdraw, &colors[257], 0, 0, win_w, win_h);
+        if (prev_buf) {
+            for (int i = 0; i < rows*cols; i++) prev_buf[i].len = 0xff;
+        }
+        force_full_redraw = 0;
+    }
+
     FcChar8 text_buf[8192];
     for (int y=0; y<rows; y++) {
         int x = 0;
         while (x < cols) {
-            Cell *c;
-            if (scroll_off > 0) {
-                long abs_y = (long)scroll_lines - scroll_off + y;
-                if (abs_y < scroll_lines) {
-                    if (abs_y >= 0 && abs_y >= (long)scroll_lines - SCROLLBACK) {
-                        c = &scroll_buf[(abs_y % SCROLLBACK)*cols + x];
-                    } else c = &b_cell;
-                } else {
-                    int sy = abs_y - scroll_lines;
-                    if (sy >= 0 && sy < rows) c = &screen_buf[sy*cols + x];
-                    else c = &b_cell;
-                }
-            } else {
-                c = cell_at(x, y);
+            Cell *c = get_cell_to_draw(x, y);
+            if (prev_buf && cells_equal(c, &prev_buf[y*cols + x])) {
+                x++;
+                continue;
             }
-
-            int fg_i = c->fg, bg_i = c->bg;
-            if (c->attr & ATTR_REVERSE) { int t=fg_i; fg_i=bg_i; bg_i=t; }
 
             int run_len = 1;
             int text_len = c->len;
             if (text_len > 0) memcpy(text_buf, c->ch, c->len);
 
+            int fg_i = c->fg, bg_i = c->bg;
+            if (c->attr & ATTR_REVERSE) { int t=fg_i; fg_i=bg_i; bg_i=t; }
+
             for (int nx = x + 1; nx < cols; nx++) {
-                Cell *nc;
-                if (scroll_off > 0) {
-                    long abs_y = (long)scroll_lines - scroll_off + y;
-                    if (abs_y < scroll_lines) {
-                        if (abs_y >= 0 && abs_y >= (long)scroll_lines - SCROLLBACK) {
-                            nc = &scroll_buf[(abs_y % SCROLLBACK)*cols + nx];
-                        } else nc = &b_cell;
-                    } else {
-                        int sy = abs_y - scroll_lines;
-                        if (sy >= 0 && sy < rows) nc = &screen_buf[sy*cols + nx];
-                        else nc = &b_cell;
-                    }
-                } else {
-                    nc = cell_at(nx, y);
-                }
+                Cell *nc = get_cell_to_draw(nx, y);
+                if (prev_buf && cells_equal(nc, &prev_buf[y*cols + nx])) break;
 
                 int nfg = nc->fg, nbg = nc->bg;
                 if (nc->attr & ATTR_REVERSE) { int t=nfg; nfg=nbg; nbg=t; }
@@ -232,9 +306,7 @@ static void draw(void) {
                 }
             }
 
-            if (bg_i != 17) {
-                XftDrawRect(xdraw, &colors[bg_i], x*cw, y*ch, run_len*cw, ch);
-            }
+            XftDrawRect(xdraw, &colors[bg_i], x*cw, y*ch, run_len*cw, ch);
             if (text_len > 0) {
                 XftColor *fc = &colors[fg_i];
                 if (c->attr & ATTR_BOLD && fg_i < 8) fc = &colors[fg_i+8];
@@ -250,19 +322,52 @@ static void draw(void) {
                 XftDrawRect(xdraw, &colors[fg_i], x*cw, y*ch+ch-1, run_len*cw, 1);
             }
 
+            if (prev_buf) {
+                for (int i = 0; i < run_len; i++) {
+                    prev_buf[y*cols + x + i] = *get_cell_to_draw(x + i, y);
+                }
+            }
+
             x += run_len;
         }
     }
+
     /* cursor */
-    if (scroll_off == 0 && cursor_visible) {
-        int cxp = pending_wrap ? cols - 1 : (cx < cols ? cx : cols-1);
-        XftDrawRect(xdraw, &colors[16], cxp*cw, cy*ch, cw, ch);
-        Cell *cc = cell_at(cxp, cy);
+    int draw_cursor = (scroll_off == 0 && cursor_visible);
+    int cxp = 0, cyp = 0;
+    if (draw_cursor) {
+        cxp = pending_wrap ? cols - 1 : (cx < cols ? cx : cols-1);
+        cyp = cy;
+        XftDrawRect(xdraw, &colors[256], cxp*cw, cyp*ch, cw, ch);
+        Cell *cc = cell_at(cxp, cyp);
         if (cc->len > 0)
-            XftDrawStringUtf8(xdraw, &colors[17], fnt, cxp*cw, cy*ch+fnt->ascent,
+            XftDrawStringUtf8(xdraw, &colors[257], fnt, cxp*cw, cyp*ch+fnt->ascent,
                 (FcChar8*)cc->ch, cc->len);
     }
+
     XCopyArea(dpy, buf, win, xgc, 0, 0, win_w, win_h, 0, 0);
+
+    /* restore cell under cursor on pixmap buf */
+    if (draw_cursor) {
+        Cell *cc = cell_at(cxp, cyp);
+        int fg_i = cc->fg, bg_i = cc->bg;
+        if (cc->attr & ATTR_REVERSE) { int t=fg_i; fg_i=bg_i; bg_i=t; }
+        XftDrawRect(xdraw, &colors[bg_i], cxp*cw, cyp*ch, cw, ch);
+        if (cc->len > 0) {
+            XftColor *fc = &colors[fg_i];
+            if (cc->attr & ATTR_BOLD && fg_i < 8) fc = &colors[fg_i+8];
+            int all_spaces = 1;
+            for (int i=0; i<cc->len; i++) {
+                if (cc->ch[i] != ' ' && cc->ch[i] != 0) { all_spaces = 0; break; }
+            }
+            if (!all_spaces) {
+                XftDrawStringUtf8(xdraw, fc, fnt, cxp*cw, cyp*ch+fnt->ascent, (FcChar8*)cc->ch, cc->len);
+            }
+        }
+        if (cc->attr & ATTR_UNDERLINE) {
+            XftDrawRect(xdraw, &colors[fg_i], cxp*cw, cyp*ch+ch-1, cw, 1);
+        }
+    }
 }
 
 static int parse_params(const char *s, int *params, int max) {
@@ -279,7 +384,7 @@ static void handle_sgr(void) {
     int params[16]={0}; int np=parse_params(esc_buf,params,16);
     for (int i=0;i<np;i++) {
         int p=params[i];
-        if (p==0) { cur_fg=16; cur_bg=17; cur_attr=0; }
+        if (p==0) { cur_fg=256; cur_bg=257; cur_attr=0; }
         else if (p==1) cur_attr|=ATTR_BOLD;
         else if (p==4) cur_attr|=ATTR_UNDERLINE;
         else if (p==7) cur_attr|=ATTR_REVERSE;
@@ -287,11 +392,33 @@ static void handle_sgr(void) {
         else if (p==24) cur_attr&=~ATTR_UNDERLINE;
         else if (p==27) cur_attr&=~ATTR_REVERSE;
         else if (p>=30&&p<=37) cur_fg=p-30;
-        else if (p==39) cur_fg=16;
+        else if (p==39) cur_fg=256;
         else if (p>=40&&p<=47) cur_bg=p-40;
-        else if (p==49) cur_bg=17;
+        else if (p==49) cur_bg=257;
         else if (p>=90&&p<=97) cur_fg=p-90+8;
         else if (p>=100&&p<=107) cur_bg=p-100+8;
+        else if (p==38) {
+            if (i+1 < np) {
+                if (params[i+1] == 5 && i+2 < np) {
+                    cur_fg = params[i+2];
+                    i += 2;
+                } else if (params[i+1] == 2 && i+4 < np) {
+                    cur_fg = match_color(params[i+2], params[i+3], params[i+4]);
+                    i += 4;
+                }
+            }
+        }
+        else if (p==48) {
+            if (i+1 < np) {
+                if (params[i+1] == 5 && i+2 < np) {
+                    cur_bg = params[i+2];
+                    i += 2;
+                } else if (params[i+1] == 2 && i+4 < np) {
+                    cur_bg = match_color(params[i+2], params[i+3], params[i+4]);
+                    i += 4;
+                }
+            }
+        }
     }
 }
 
@@ -417,6 +544,7 @@ static void process_byte(unsigned char c) {
         return; /* ignore other controls */
     }
 
+    if (esc_state==5) { esc_state=0; esc_len=0; return; }
     if (esc_state==3) { /* OSC - eat until ST or BEL */
         if (c==0x9c) { esc_state=0; esc_len=0; }
         else if (c==27) esc_state=4; /* possible ST */
@@ -430,14 +558,15 @@ static void process_byte(unsigned char c) {
         return;
     }
     if (esc_state==1) { /* after ESC */
+        if (c=='[') { esc_state=2; memset(esc_buf,0,MAX_ESC); return; }
+        else if (c==']') { esc_state=3; return; }
+        else if (c=='(' || c==')' || c=='*' || c=='+' || c=='-' || c=='.' || c=='/' || c=='%') { esc_state=5; return; }
         esc_state=0; esc_len=0;
-        if (c=='[') { esc_state=2; memset(esc_buf,0,MAX_ESC); }
-        else if (c==']') { esc_state=3; }
-        else if (c=='D') newline();
+        if (c=='D') newline();
         else if (c=='M') { if(cy<=scroll_top) scroll_down(scroll_top,scroll_bot); else cy--; pending_wrap=0; }
         else if (c=='7') { save_cx=cx; save_cy=cy; }
         else if (c=='8') { cx=save_cx; cy=save_cy; pending_wrap=0; }
-        else if (c=='c') { clear_region(0,0,cols-1,rows-1); cx=cy=0; cur_fg=16; cur_bg=17; cur_attr=0; pending_wrap=0; }
+        else if (c=='c') { clear_region(0,0,cols-1,rows-1); cx=cy=0; cur_fg=256; cur_bg=257; cur_attr=0; pending_wrap=0; }
         return;
     }
     
@@ -476,7 +605,7 @@ static void resize_term(void) {
     Cell *n_pri = calloc(new_rows*new_cols, sizeof(Cell));
     Cell *n_alt = calloc(new_rows*new_cols, sizeof(Cell));
     Cell b = blank_cell();
-    b.fg = 16; b.bg = 17; b.attr = 0;
+    b.fg = 256; b.bg = 257; b.attr = 0;
     for (int i=0;i<new_rows*new_cols;i++) {
         n_pri[i]=b; n_alt[i]=b;
     }
@@ -568,6 +697,13 @@ static void resize_term(void) {
     buf = XCreatePixmap(dpy, win, win_w, win_h, DefaultDepth(dpy,scr));
     if (xdraw) XftDrawDestroy(xdraw);
     xdraw = XftDrawCreate(dpy, buf, vis, cmap);
+
+    if (prev_buf) free(prev_buf);
+    prev_buf = calloc(new_rows*new_cols, sizeof(Cell));
+    if (prev_buf) {
+        for (int i = 0; i < new_rows*new_cols; i++) prev_buf[i].len = 0xff;
+    }
+    force_full_redraw = 1;
 
     struct winsize ws = {.ws_row=rows, .ws_col=cols, .ws_xpixel=win_w, .ws_ypixel=win_h};
     ioctl(master_fd, TIOCSWINSZ, &ws);
@@ -668,8 +804,13 @@ int main(void) {
     alt_buf = calloc(rows*cols, sizeof(Cell));
     screen_buf = pri_buf;
     scroll_buf = calloc(SCROLLBACK*cols, sizeof(Cell));
+    prev_buf = calloc(rows*cols, sizeof(Cell));
     Cell b = blank_cell();
     for (int i=0;i<rows*cols;i++) { pri_buf[i]=b; alt_buf[i]=b; }
+    if (prev_buf) {
+        for (int i=0;i<rows*cols;i++) prev_buf[i].len = 0xff;
+    }
+    force_full_redraw = 1;
     scroll_top=0; scroll_bot=rows-1;
 
     /* Fork PTY */
@@ -712,7 +853,7 @@ int main(void) {
         int needs_immediate_draw = 0;
         while (XPending(dpy)) {
             XEvent ev; XNextEvent(dpy, &ev);
-            if (ev.type == Expose && ev.xexpose.count == 0) { dirty = 1; needs_immediate_draw = 1; }
+            if (ev.type == Expose && ev.xexpose.count == 0) { dirty = 1; needs_immediate_draw = 1; force_full_redraw = 1; }
             else if (ev.type == KeyPress) { handle_key(&ev.xkey); dirty = 1; }
             else if (ev.type == ConfigureNotify) { resize_term(); dirty = 1; needs_immediate_draw = 1; }
         }
@@ -733,5 +874,6 @@ int main(void) {
     free(pri_buf);
     free(alt_buf);
     free(scroll_buf);
+    if (prev_buf) free(prev_buf);
     return 0;
 }
