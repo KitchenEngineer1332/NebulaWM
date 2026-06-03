@@ -10,7 +10,7 @@
 #include <ctype.h>
 
 int config_border_width = 2;
-int config_bar_height = 30;
+int config_bar_height = 32;
 int config_wm_type = 0; // 0 for nogaps, 1 for float
 unsigned long config_focused_color = 0x7aa2f7;
 unsigned long config_unfocused_color = 0x414868;
@@ -102,6 +102,6 @@ void load_config(void) {
     fclose(f);
     
     Theme t = load_theme();
-    config_focused_color = get_color(t.border);
-    config_unfocused_color = get_color(t.dim);
+    config_focused_color = t.border;
+    config_unfocused_color = t.dim;
 }

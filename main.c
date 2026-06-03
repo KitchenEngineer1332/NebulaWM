@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include "config.h"
 #include "theme.h"
+#include <locale.h>
 
 typedef struct Client Client;
 struct Client {
@@ -19,6 +20,7 @@ struct Client {
     int ws;
     int is_dock;
     int is_floating;
+    int mapped;
     Client *next;
     Client *prev;
 };
@@ -32,9 +34,72 @@ int layout_modes[9] = {0};
 
 Client *clients = NULL;
 
+XineramaScreenInfo *screens = NULL;
+int n_screens = 0;
+
+void update_screens() {
+    if (screens) XFree(screens);
+    if (XineramaIsActive(dpy)) {
+        screens = XineramaQueryScreens(dpy, &n_screens);
+    } else {
+        screens = NULL;
+        n_screens = 0;
+    }
+}
+
 /* Focus Stack for MRU */
 Window focus_stack[1024];
 int focus_stack_count = 0;
+
+typedef struct {
+    Atom net_client_list;
+    Atom net_wm_window_type;
+    Atom net_wm_window_type_dock;
+    Atom net_wm_window_type_dialog;
+    Atom net_wm_window_type_utility;
+    Atom net_wm_window_type_toolbar;
+    Atom net_wm_window_type_splash;
+    Atom net_wm_desktop;
+    Atom net_current_desktop;
+    Atom net_number_of_desktops;
+    Atom nebula_layout;
+    Atom nebula_toggle_layout;
+} NetAtoms;
+
+NetAtoms net;
+
+typedef struct {
+    KeySym ret;
+    KeySym q;
+    KeySym d;
+    KeySym f;
+    KeySym tab;
+    KeySym del;
+} KeySyms;
+
+KeySyms keys;
+
+void init_atoms() {
+    net.net_client_list = XInternAtom(dpy, "_NET_CLIENT_LIST", False);
+    net.net_wm_window_type = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
+    net.net_wm_window_type_dock = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DOCK", False);
+    net.net_wm_window_type_dialog = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DIALOG", False);
+    net.net_wm_window_type_utility = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_UTILITY", False);
+    net.net_wm_window_type_toolbar = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_TOOLBAR", False);
+    net.net_wm_window_type_splash = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_SPLASH", False);
+    net.net_wm_desktop = XInternAtom(dpy, "_NET_WM_DESKTOP", False);
+    net.net_current_desktop = XInternAtom(dpy, "_NET_CURRENT_DESKTOP", False);
+    net.net_number_of_desktops = XInternAtom(dpy, "_NET_NUMBER_OF_DESKTOPS", False);
+    net.nebula_layout = XInternAtom(dpy, "_NEBULA_CURRENT_LAYOUT", False);
+    net.nebula_toggle_layout = XInternAtom(dpy, "_NEBULA_TOGGLE_LAYOUT", False);
+
+    keys.ret = XStringToKeysym("Return");
+    keys.q = XStringToKeysym("q");
+    keys.d = XStringToKeysym("d");
+    keys.f = XStringToKeysym("f");
+    keys.tab = XStringToKeysym("Tab");
+    keys.del = XStringToKeysym("Delete");
+}
 
 void remove_from_stack(Window w) {
     for (int i = 0; i < focus_stack_count; i++) {
@@ -51,9 +116,7 @@ void remove_from_stack(Window w) {
 void add_to_stack(Window w) {
     remove_from_stack(w);
     if (focus_stack_count < 1024) {
-        for (int i = focus_stack_count; i > 0; i--) {
-            focus_stack[i] = focus_stack[i-1];
-        }
+        memmove(&focus_stack[1], &focus_stack[0], sizeof(Window) * focus_stack_count);
         focus_stack[0] = w;
         focus_stack_count++;
     }
@@ -67,15 +130,20 @@ Client* find_client(Window w) {
 }
 
 void update_client_list() {
-    Atom prop = XInternAtom(dpy, "_NET_CLIENT_LIST", False);
     int count = 0;
     for (Client *c = clients; c; c = c->next) count++;
     
+    if (count == 0) {
+        XDeleteProperty(dpy, root, net.net_client_list);
+        return;
+    }
+
     Window *wins = malloc(sizeof(Window) * count);
+    if (!wins) return;
     int i = 0;
     for (Client *c = clients; c; c = c->next) wins[i++] = c->win;
     
-    XChangeProperty(dpy, root, prop, XA_WINDOW, 32, PropModeReplace, (unsigned char *)wins, count);
+    XChangeProperty(dpy, root, net.net_client_list, XA_WINDOW, 32, PropModeReplace, (unsigned char *)wins, count);
     free(wins);
 }
 
@@ -98,18 +166,13 @@ void add_client(Window w) {
     int actual_format;
     unsigned long nitems, bytes_after;
     unsigned char *prop = NULL;
-    Atom dock = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DOCK", False);
-    Atom dialog = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DIALOG", False);
-    Atom utility = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_UTILITY", False);
-    Atom toolbar = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_TOOLBAR", False);
-    Atom splash = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_SPLASH", False);
-    Atom type_atom = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
     
-    if (XGetWindowProperty(dpy, w, type_atom, 0, 1, False, XA_ATOM,
+    if (XGetWindowProperty(dpy, w, net.net_wm_window_type, 0, 1, False, XA_ATOM,
                            &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success && prop) {
         Atom t = *(Atom *)prop;
-        if (t == dock) c->is_dock = 1;
-        if (t == dialog || t == utility || t == toolbar || t == splash) c->is_floating = 1;
+        if (t == net.net_wm_window_type_dock) c->is_dock = 1;
+        if (t == net.net_wm_window_type_dialog || t == net.net_wm_window_type_utility || 
+            t == net.net_wm_window_type_toolbar || t == net.net_wm_window_type_splash) c->is_floating = 1;
         XFree(prop);
     }
 
@@ -118,7 +181,7 @@ void add_client(Window w) {
 
     // Get workspace
     c->ws = -1;
-    if (XGetWindowProperty(dpy, w, XInternAtom(dpy, "_NET_WM_DESKTOP", False),
+    if (XGetWindowProperty(dpy, w, net.net_wm_desktop,
                            0, 1, False, XA_CARDINAL, &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success && prop) {
         if (nitems > 0) c->ws = *(unsigned long *)prop;
         XFree(prop);
@@ -127,14 +190,16 @@ void add_client(Window w) {
     if (c->ws == -1 && !c->is_dock) {
         c->ws = current_workspace;
         unsigned long ws = c->ws;
-        XChangeProperty(dpy, w, XInternAtom(dpy, "_NET_WM_DESKTOP", False), XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&ws, 1);
+        XChangeProperty(dpy, w, net.net_wm_desktop, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&ws, 1);
     }
+
+    c->mapped = (wa.map_state == IsViewable);
 
     c->next = clients;
     if (clients) clients->prev = c;
     clients = c;
     
-    if (!c->is_dock && wa.map_state == IsViewable) {
+    if (!c->is_dock && c->mapped) {
         add_to_stack(w);
     }
     update_client_list();
@@ -182,12 +247,12 @@ XftColor s_bg, s_fg, s_sel_bg, s_sel_fg, s_dim, s_border;
 
 void alloc_switcher_colors() {
     Theme t = load_theme();
-    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.bg, &s_bg);
-    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.fg, &s_fg);
-    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.sel_bg, &s_sel_bg);
-    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.sel_fg, &s_sel_fg);
-    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.dim, &s_dim);
-    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.border, &s_border);
+    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.bg_hex, &s_bg);
+    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.fg_hex, &s_fg);
+    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.sel_bg_hex, &s_sel_bg);
+    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.sel_fg_hex, &s_sel_fg);
+    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.dim_hex, &s_dim);
+    XftColorAllocName(dpy, switcher_visual, switcher_cmap, t.border_hex, &s_border);
 }
 
 void free_switcher_colors() {
@@ -283,9 +348,11 @@ void update_switcher_items() {
         char *name;
         if (XFetchName(dpy, w, &name) && name) {
             strncpy(switcher_items[switcher_count].name, name, 255);
+            switcher_items[switcher_count].name[255] = '\0';
             XFree(name);
         } else {
-            strcpy(switcher_items[switcher_count].name, "Unnamed Window");
+            strncpy(switcher_items[switcher_count].name, "Unnamed Window", 255);
+            switcher_items[switcher_count].name[255] = '\0';
         }
         switcher_items[switcher_count].win = w;
         switcher_items[switcher_count].workspace = c->ws;
@@ -321,7 +388,10 @@ void start_switching() {
     
     if (!switcher_font) {
         switcher_font = XftFontOpenName(dpy, DefaultScreen(dpy), "monospace:size=12");
-        if (!switcher_font) switcher_font = XftFontOpenName(dpy, DefaultScreen(dpy), "fixed");
+        if (!switcher_font) {
+            fprintf(stderr, "nebulawm: warning: could not load 'monospace' font, falling back to fixed\n");
+            switcher_font = XftFontOpenName(dpy, DefaultScreen(dpy), "fixed");
+        }
     }
 
     alloc_switcher_colors();
@@ -361,15 +431,12 @@ void stop_switching() {
 }
 
 void update_workspace_hints() {
-    Atom cur = XInternAtom(dpy, "_NET_CURRENT_DESKTOP", False);
-    Atom num = XInternAtom(dpy, "_NET_NUMBER_OF_DESKTOPS", False);
-    Atom layout_atom = XInternAtom(dpy, "_NEBULA_CURRENT_LAYOUT", False);
     unsigned long n = 9;
     unsigned long c = current_workspace;
     unsigned long layout = layout_modes[current_workspace];
-    XChangeProperty(dpy, root, num, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&n, 1);
-    XChangeProperty(dpy, root, cur, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&c, 1);
-    XChangeProperty(dpy, root, layout_atom, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&layout, 1);
+    XChangeProperty(dpy, root, net.net_number_of_desktops, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&n, 1);
+    XChangeProperty(dpy, root, net.net_current_desktop, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&c, 1);
+    XChangeProperty(dpy, root, net.nebula_layout, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&layout, 1);
 }
 
 void raise_docks() {
@@ -385,23 +452,17 @@ void tile_windows(int ws) {
 
     int count = 0;
     for (Client *c = clients; c; c = c->next) {
-        if (!c->is_dock && !c->is_floating && c->ws == ws) {
-            XWindowAttributes wa;
-            if (XGetWindowAttributes(dpy, c->win, &wa) && wa.map_state == IsViewable)
-                count++;
-        }
+        if (!c->is_dock && !c->is_floating && c->ws == ws && c->mapped)
+            count++;
     }
 
     if (count > 0) {
         int sx = 0, sy = 0, sw, sh;
-        int n;
-        XineramaScreenInfo *info = NULL;
-        if (XineramaIsActive(dpy) && (info = XineramaQueryScreens(dpy, &n))) {
-            sx = info[0].x_org;
-            sy = info[0].y_org;
-            sw = info[0].width;
-            sh = info[0].height;
-            XFree(info);
+        if (screens && n_screens > 0) {
+            sx = screens[0].x_org;
+            sy = screens[0].y_org;
+            sw = screens[0].width;
+            sh = screens[0].height;
         } else {
             int screen = DefaultScreen(dpy);
             sw = DisplayWidth(dpy, screen);
@@ -416,24 +477,27 @@ void tile_windows(int ws) {
         Client *ws_clients[count];
         int real_count = 0;
         for (Client *c = clients; c; c = c->next) {
-            if (!c->is_dock && !c->is_floating && c->ws == ws) {
-                XWindowAttributes wa;
-                if (XGetWindowAttributes(dpy, c->win, &wa) && wa.map_state == IsViewable) {
-                    if (real_count < count) ws_clients[real_count++] = c;
-                }
+            if (!c->is_dock && !c->is_floating && c->ws == ws && c->mapped) {
+                if (real_count < count) ws_clients[real_count++] = c;
             }
         }
 
         if (real_count == 1) {
             XMoveResizeWindow(dpy, ws_clients[0]->win, sx + gap, wy + gap, sw - 2*bw - 2*gap, wh - 2*bw - 2*gap);
+            ws_clients[0]->x = sx + gap; ws_clients[0]->y = wy + gap;
+            ws_clients[0]->w = sw - 2*bw - 2*gap; ws_clients[0]->h = wh - 2*bw - 2*gap;
         } else if (real_count > 1) {
             int master_w = sw / 2;
             XMoveResizeWindow(dpy, ws_clients[0]->win, sx + gap, wy + gap, master_w - 2*bw - 2*gap, wh - 2*bw - 2*gap);
+            ws_clients[0]->x = sx + gap; ws_clients[0]->y = wy + gap;
+            ws_clients[0]->w = master_w - 2*bw - 2*gap; ws_clients[0]->h = wh - 2*bw - 2*gap;
 
             int stack_w = sw - master_w;
             int stack_h = wh / (real_count - 1);
             for (int i = 1; i < real_count; i++) {
                 XMoveResizeWindow(dpy, ws_clients[i]->win, sx + master_w + gap, wy + (i - 1) * stack_h + gap, stack_w - 2*bw - 2*gap, stack_h - 2*bw - 2*gap);
+                ws_clients[i]->x = sx + master_w + gap; ws_clients[i]->y = wy + (i - 1) * stack_h + gap;
+                ws_clients[i]->w = stack_w - 2*bw - 2*gap; ws_clients[i]->h = stack_h - 2*bw - 2*gap;
             }
         }
     }
@@ -460,8 +524,13 @@ void set_focus(Window w) {
 void show_hide_windows() {
     for (Client *c = clients; c; c = c->next) {
         if (c->is_dock) continue;
-        if (c->ws == current_workspace) XMapWindow(dpy, c->win);
-        else XUnmapWindow(dpy, c->win);
+        if (c->ws == current_workspace) {
+            XMapWindow(dpy, c->win);
+            c->mapped = 1;
+        } else {
+            XUnmapWindow(dpy, c->win);
+            c->mapped = 0;
+        }
     }
 
     if (last_focused[current_workspace]) {
@@ -472,25 +541,21 @@ void show_hide_windows() {
 }
 
 void grab_keys() {
-    XGrabKey(dpy, XKeysymToKeycode(dpy, XStringToKeysym("Return")), config_modifier, root, True, GrabModeAsync, GrabModeAsync);
-    XGrabKey(dpy, XKeysymToKeycode(dpy, XStringToKeysym("q")), config_modifier, root, True, GrabModeAsync, GrabModeAsync);
-    XGrabKey(dpy, XKeysymToKeycode(dpy, XStringToKeysym("q")), config_modifier | ShiftMask, root, True, GrabModeAsync, GrabModeAsync);
-    XGrabKey(dpy, XKeysymToKeycode(dpy, XStringToKeysym("d")), config_modifier, root, True, GrabModeAsync, GrabModeAsync);
-    XGrabKey(dpy, XKeysymToKeycode(dpy, XStringToKeysym("Delete")), ControlMask | Mod1Mask, root, True, GrabModeAsync, GrabModeAsync);
-    
-    for (int i = 1; i <= 9; i++) {
-        char key[2];
-        snprintf(key, 2, "%d", i);
-        XGrabKey(dpy, XKeysymToKeycode(dpy, XStringToKeysym(key)), config_modifier, root, True, GrabModeAsync, GrabModeAsync);
-        XGrabKey(dpy, XKeysymToKeycode(dpy, XStringToKeysym(key)), config_modifier | ShiftMask, root, True, GrabModeAsync, GrabModeAsync);
-    }
-    
-    // Alt+Tab
-    XGrabKey(dpy, XKeysymToKeycode(dpy, XStringToKeysym("Tab")), Mod1Mask, root, True, GrabModeAsync, GrabModeAsync);
+    XUngrabKey(dpy, AnyKey, AnyModifier, root);
+    XGrabKey(dpy, XKeysymToKeycode(dpy, keys.ret), config_modifier, root, True, GrabModeAsync, GrabModeAsync);
+    XGrabKey(dpy, XKeysymToKeycode(dpy, keys.q), config_modifier, root, True, GrabModeAsync, GrabModeAsync);
+    XGrabKey(dpy, XKeysymToKeycode(dpy, keys.q), config_modifier | ShiftMask, root, True, GrabModeAsync, GrabModeAsync);
+    XGrabKey(dpy, XKeysymToKeycode(dpy, keys.d), config_modifier, root, True, GrabModeAsync, GrabModeAsync);
+    XGrabKey(dpy, XKeysymToKeycode(dpy, keys.del), ControlMask | Mod1Mask, root, True, GrabModeAsync, GrabModeAsync);
 
-    // Layout/Floating toggle
-    XGrabKey(dpy, XKeysymToKeycode(dpy, XStringToKeysym("f")), config_modifier, root, True, GrabModeAsync, GrabModeAsync);
-    XGrabKey(dpy, XKeysymToKeycode(dpy, XStringToKeysym("f")), config_modifier | ShiftMask, root, True, GrabModeAsync, GrabModeAsync);
+    for (int i = 0; i < 9; i++) {
+        XGrabKey(dpy, XKeysymToKeycode(dpy, XK_1 + i), config_modifier, root, True, GrabModeAsync, GrabModeAsync);
+        XGrabKey(dpy, XKeysymToKeycode(dpy, XK_1 + i), config_modifier | ShiftMask, root, True, GrabModeAsync, GrabModeAsync);
+    }
+
+    XGrabKey(dpy, XKeysymToKeycode(dpy, keys.tab), Mod1Mask, root, True, GrabModeAsync, GrabModeAsync);
+    XGrabKey(dpy, XKeysymToKeycode(dpy, keys.f), config_modifier, root, True, GrabModeAsync, GrabModeAsync);
+    XGrabKey(dpy, XKeysymToKeycode(dpy, keys.f), config_modifier | ShiftMask, root, True, GrabModeAsync, GrabModeAsync);
 }
 
 void grab_buttons() {
@@ -509,20 +574,7 @@ int main() {
     XWindowAttributes attr;
     XButtonEvent start;
     start.subwindow = None;
-
-    load_config();
-
-    for (int i = 0; i < 9; i++) {
-        layout_modes[i] = (config_wm_type == 1) ? 0 : 1;
-    }
-
-    if (config_wallpaper[0] != '\0') {
-        if (fork() == 0) {
-            setsid();
-            execlp("feh", "feh", "--bg-scale", config_wallpaper, NULL);
-            exit(0);
-        }
-    }
+    start.button = 0;
 
     if (!(dpy = XOpenDisplay(NULL))) {
         fprintf(stderr, "NebulaWM: cannot open display\n");
@@ -530,8 +582,23 @@ int main() {
     }
 
     XSetErrorHandler(xerror);
-
     root = DefaultRootWindow(dpy);
+
+    init_atoms();
+    load_config();
+    update_screens();
+
+    for (int i = 0; i < 9; i++) {
+        layout_modes[i] = (config_wm_type == 1) ? 0 : 1;
+    }
+
+    if (config_wallpaper[0] != '\0') {
+        theme_set_wallpaper(dpy, root, config_wallpaper);
+    } else {
+        // Set a default background color if no wallpaper is specified
+        XSetWindowBackground(dpy, root, 0x222222);
+        XClearWindow(dpy, root);
+    }
 
     grab_keys();
     grab_buttons();
@@ -547,6 +614,13 @@ int main() {
         if (children) XFree(children);
     }
 
+    // Start the compositor
+    if (fork() == 0) {
+        setsid();
+        execlp("nebula-compositor", "nebula-compositor", NULL);
+        _exit(1);
+    }
+
     // Start the bar
     if (fork() == 0) {
         setsid();
@@ -554,15 +628,17 @@ int main() {
         _exit(1);
     }
 
-    XSelectInput(dpy, root, SubstructureRedirectMask | SubstructureNotifyMask);
+    XSelectInput(dpy, root, SubstructureRedirectMask | SubstructureNotifyMask | PropertyChangeMask);
 
     int running = 1;
-    while (running && !XNextEvent(dpy, &ev)) {
+    while (running) {
+        XNextEvent(dpy, &ev);
         if (ev.type == MapRequest) {
             Window w = ev.xmaprequest.window;
             add_client(w);
             Client *c = find_client(w);
             if (c) {
+                c->mapped = 1;
                 XSelectInput(dpy, w, EnterWindowMask);
                 if (!c->is_dock && c->y < config_bar_height) {
                     c->y = config_bar_height;
@@ -589,7 +665,11 @@ int main() {
             }
             tile_windows(current_workspace);
         } else if (ev.type == UnmapNotify) {
-            tile_windows(current_workspace);
+            Client *c = find_client(ev.xunmap.window);
+            if (c) {
+                c->mapped = 0;
+                tile_windows(c->ws);
+            }
         } else if (ev.type == ConfigureRequest) {
             XWindowChanges wc;
             wc.x = ev.xconfigurerequest.x;
@@ -608,25 +688,25 @@ int main() {
             }
         } else if (ev.type == KeyPress) {
             KeySym keysym = XkbKeycodeToKeysym(dpy, ev.xkey.keycode, 0, 0);
-            if (keysym == XStringToKeysym("Return")) {
+            if (keysym == keys.ret) {
                 if (fork() == 0) {
                     setsid();
                     execlp("sh", "sh", "-c", config_terminal, NULL);
                     _exit(1);
                 }
-            } else if (keysym == XStringToKeysym("q")) {
+            } else if (keysym == keys.q) {
                 if (ev.xkey.state & ShiftMask) {
                     running = 0;
                 } else if (focused_win) {
                     XKillClient(dpy, focused_win);
                 }
-            } else if (keysym == XStringToKeysym("d")) {
+            } else if (keysym == keys.d) {
                 if (fork() == 0) {
                     setsid();
                     execlp("sh", "sh", "-c", config_launcher, NULL);
                     _exit(1);
                 }
-            } else if (keysym == XStringToKeysym("Delete") && (ev.xkey.state & (ControlMask | Mod1Mask)) == (ControlMask | Mod1Mask)) {
+            } else if (keysym == keys.del && (ev.xkey.state & (ControlMask | Mod1Mask)) == (ControlMask | Mod1Mask)) {
                 if (fork() == 0) {
                     setsid();
                     execlp("nebula-powermenu", "nebula-powermenu", NULL);
@@ -640,7 +720,7 @@ int main() {
                         if (c) {
                             c->ws = ws;
                             unsigned long wsv = ws;
-                            XChangeProperty(dpy, focused_win, XInternAtom(dpy, "_NET_WM_DESKTOP", False), XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&wsv, 1);
+                            XChangeProperty(dpy, focused_win, net.net_wm_desktop, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&wsv, 1);
                             XUnmapWindow(dpy, focused_win);
                             tile_windows(current_workspace);
                             tile_windows(ws);
@@ -652,7 +732,7 @@ int main() {
                     show_hide_windows();
                     tile_windows(current_workspace);
                 }
-            } else if (keysym == XStringToKeysym("f")) {
+            } else if (keysym == keys.f) {
                 if (ev.xkey.state & ShiftMask) {
                     if (focused_win && focused_win != root) {
                         Client *c = find_client(focused_win);
@@ -666,7 +746,7 @@ int main() {
                     update_workspace_hints();
                     tile_windows(current_workspace);
                 }
-            } else if (keysym == XStringToKeysym("Tab") && (ev.xkey.state & Mod1Mask)) {
+            } else if (keysym == keys.tab && (ev.xkey.state & Mod1Mask)) {
                 if (!is_switching) {
                     start_switching();
                 } else {
@@ -774,26 +854,26 @@ int main() {
             }
             start.subwindow = None;
         } else if (ev.type == ClientMessage) {
-            if (ev.xclient.message_type == XInternAtom(dpy, "_NET_CURRENT_DESKTOP", False)) {
+            if (ev.xclient.message_type == net.net_current_desktop) {
                 if (ev.xclient.data.l[0] >= 0 && ev.xclient.data.l[0] < 9) {
                     current_workspace = ev.xclient.data.l[0];
                     update_workspace_hints();
                     show_hide_windows();
                 }
-            } else if (ev.xclient.message_type == XInternAtom(dpy, "_NET_WM_DESKTOP", False)) {
+            } else if (ev.xclient.message_type == net.net_wm_desktop) {
                 int ws = ev.xclient.data.l[0];
                 if (ws >= 0 && ws < 9) {
                     Client *c = find_client(ev.xclient.window);
                     if (c) {
                         c->ws = ws;
-                        XChangeProperty(dpy, ev.xclient.window, XInternAtom(dpy, "_NET_WM_DESKTOP", False), XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&ws, 1);
+                        XChangeProperty(dpy, ev.xclient.window, net.net_wm_desktop, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&ws, 1);
                         if (ws != current_workspace) XUnmapWindow(dpy, ev.xclient.window);
                         else XMapWindow(dpy, ev.xclient.window);
                         tile_windows(ws);
                         tile_windows(current_workspace);
                     }
                 }
-            } else if (ev.xclient.message_type == XInternAtom(dpy, "_NEBULA_TOGGLE_LAYOUT", False)) {
+            } else if (ev.xclient.message_type == net.nebula_toggle_layout) {
                 layout_modes[current_workspace] ^= 1;
                 update_workspace_hints();
                 tile_windows(current_workspace);

@@ -72,32 +72,31 @@ static char esc_buf[MAX_ESC];
 static int esc_len = 0;
 static int esc_state = 0; /* 0=normal, 1=ESC, 2=CSI, 3=OSC, 5=charset */
 
-static int running = 1;
+static volatile sig_atomic_t running = 1;
 static int dirty = 1;
 
 static void init_colors(void) {
     Theme t = load_theme();
-    unsigned long p = 0;
-    if (t.border[0]=='#') p = strtoul(t.border+1,NULL,16);
-    unsigned long bk = 0x101014;
+    uint32_t p = t.border;
+    uint32_t bk = t.bg;
     char hex[16];
     /* ANSI 0-7: dark variants */
-    blend_color(p, bk, 0.10f, hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[0]);
-    blend_color(0xf7768e, bk, 0.85f, hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[1]);
-    blend_color(0x9ece6a, bk, 0.85f, hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[2]);
-    blend_color(0xe0af68, bk, 0.85f, hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[3]);
-    blend_color(p, bk, 0.70f, hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[4]);
-    blend_color(0xbb9af7, bk, 0.85f, hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[5]);
-    blend_color(0x7dcfff, bk, 0.85f, hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[6]);
-    blend_color(0xc0caf5, bk, 0.85f, hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[7]);
+    theme_color_to_hex(theme_blend(p, bk, 0.10f), hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[0]);
+    theme_color_to_hex(theme_blend(0xf7768e, bk, 0.85f), hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[1]);
+    theme_color_to_hex(theme_blend(0x9ece6a, bk, 0.85f), hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[2]);
+    theme_color_to_hex(theme_blend(0xe0af68, bk, 0.85f), hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[3]);
+    theme_color_to_hex(theme_blend(p, bk, 0.70f), hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[4]);
+    theme_color_to_hex(theme_blend(0xbb9af7, bk, 0.85f), hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[5]);
+    theme_color_to_hex(theme_blend(0x7dcfff, bk, 0.85f), hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[6]);
+    theme_color_to_hex(theme_blend(0xc0caf5, bk, 0.85f), hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[7]);
     /* ANSI 8-15: bright */
-    blend_color(p, bk, 0.30f, hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[8]);
-    blend_color(0xf7768e, 0xffffff, 0.90f, hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[9]);
-    blend_color(0x9ece6a, 0xffffff, 0.90f, hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[10]);
-    blend_color(0xe0af68, 0xffffff, 0.90f, hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[11]);
-    blend_color(p, 0xffffff, 0.70f, hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[12]);
-    blend_color(0xbb9af7, 0xffffff, 0.90f, hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[13]);
-    blend_color(0x7dcfff, 0xffffff, 0.90f, hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[14]);
+    theme_color_to_hex(theme_blend(p, bk, 0.30f), hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[8]);
+    theme_color_to_hex(theme_blend(0xf7768e, 0xffffff, 0.90f), hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[9]);
+    theme_color_to_hex(theme_blend(0x9ece6a, 0xffffff, 0.90f), hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[10]);
+    theme_color_to_hex(theme_blend(0xe0af68, 0xffffff, 0.90f), hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[11]);
+    theme_color_to_hex(theme_blend(p, 0xffffff, 0.70f), hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[12]);
+    theme_color_to_hex(theme_blend(0xbb9af7, 0xffffff, 0.90f), hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[13]);
+    theme_color_to_hex(theme_blend(0x7dcfff, 0xffffff, 0.90f), hex); XftColorAllocName(dpy,vis,cmap,hex,&colors[14]);
     XftColorAllocName(dpy,vis,cmap,"#c0caf5",&colors[15]);
 
     /* 16-231: 6x6x6 color cube */
@@ -122,13 +121,24 @@ static void init_colors(void) {
         XftColorAllocName(dpy,vis,cmap,hex,&colors[idx]);
     }
 
-    XftColorAllocName(dpy,vis,cmap,t.fg,&colors[256]);
-    XftColorAllocName(dpy,vis,cmap,t.bg,&colors[257]);
+    XftColorAllocName(dpy,vis,cmap,t.fg_hex,&colors[256]);
+    XftColorAllocName(dpy,vis,cmap,t.bg_hex,&colors[257]);
 }
 
 static int match_color(int r, int g, int b) {
+    static struct { uint8_t r, g, b; int idx; } cache[256];
+    static int cache_init = 0;
+    if (!cache_init) {
+        for (int i=0; i<256; i++) cache[i].idx = -1;
+        cache_init = 1;
+    }
+    
+    uint8_t hash = (r ^ g ^ b);
+    if (cache[hash].idx != -1 && cache[hash].r == r && cache[hash].g == g && cache[hash].b == b)
+        return cache[hash].idx;
+
     int best_idx = 0;
-    int min_dist = 10000000;
+    int min_dist = 1000000;
     for (int i = 0; i < 256; i++) {
         int cr, cg, cb;
         if (i < 16) {
@@ -157,8 +167,11 @@ static int match_color(int r, int g, int b) {
         if (dist < min_dist) {
             min_dist = dist;
             best_idx = i;
+            if (dist == 0) break;
         }
     }
+    
+    cache[hash].r = r; cache[hash].g = g; cache[hash].b = b; cache[hash].idx = best_idx;
     return best_idx;
 }
 
@@ -752,7 +765,8 @@ static void handle_key(XKeyEvent *e) {
     if (n > 0) write(master_fd, kbuf, n);
 }
 
-static void sigchld(int s) { (void)s; int st; while(waitpid(-1,&st,WNOHANG)>0); running=0; }
+static volatile sig_atomic_t child_exited = 0;
+static void sigchld(int s) { (void)s; child_exited = 1; running = 0; }
 
 int main(void) {
     setlocale(LC_ALL, "");
@@ -792,7 +806,7 @@ int main(void) {
     XChangeProperty(dpy,win,wm_name,utf8,8,PropModeReplace,(unsigned char*)"Starlight",9);
 
     Theme t = load_theme();
-    XftColor bc; XftColorAllocName(dpy,vis,cmap,t.border,&bc);
+    XftColor bc; XftColorAllocName(dpy,vis,cmap,t.border_hex,&bc);
     XSetWindowBorder(dpy, win, bc.pixel);
     XSetWindowBorderWidth(dpy, win, 2);
 
@@ -833,6 +847,13 @@ int main(void) {
     struct timespec last = {0,0};
 
     while (running) {
+        if (child_exited) {
+            int st;
+            while (waitpid(-1, &st, WNOHANG) > 0) {
+            }
+            child_exited = 0;
+        }
+
         fd_set rfds; FD_ZERO(&rfds);
         FD_SET(xfd, &rfds);
         if (master_fd >= 0) FD_SET(master_fd, &rfds);

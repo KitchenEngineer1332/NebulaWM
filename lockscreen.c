@@ -66,10 +66,19 @@ static void load_config(void) {
         char *val = strtok(NULL, "\n");
         if (key && val) {
             val[strcspn(val, "\r\n")] = 0;
-            if (strcmp(key, "font") == 0) strncpy(config_font, val, sizeof(config_font) - 1);
-            else if (strcmp(key, "date_font") == 0) strncpy(config_date_font, val, sizeof(config_date_font) - 1);
-            else if (strcmp(key, "background_type") == 0) strncpy(config_background_type, val, sizeof(config_background_type) - 1);
-            else if (strcmp(key, "background_image") == 0) strncpy(config_background_image, val, sizeof(config_background_image) - 1);
+            if (strcmp(key, "font") == 0) {
+                strncpy(config_font, val, sizeof(config_font) - 1);
+                config_font[sizeof(config_font) - 1] = '\0';
+            } else if (strcmp(key, "date_font") == 0) {
+                strncpy(config_date_font, val, sizeof(config_date_font) - 1);
+                config_date_font[sizeof(config_date_font) - 1] = '\0';
+            } else if (strcmp(key, "background_type") == 0) {
+                strncpy(config_background_type, val, sizeof(config_background_type) - 1);
+                config_background_type[sizeof(config_background_type) - 1] = '\0';
+            } else if (strcmp(key, "background_image") == 0) {
+                strncpy(config_background_image, val, sizeof(config_background_image) - 1);
+                config_background_image[sizeof(config_background_image) - 1] = '\0';
+            }
             else if (strcmp(key, "blur_radius") == 0) config_blur_radius = atoi(val);
             else if (strcmp(key, "pos_x") == 0 || strcmp(key, "clock_pos_x") == 0) {
                 if (strcmp(val, "center") == 0) config_pos_x = -1;
@@ -185,9 +194,9 @@ int main(void) {
     swa.event_mask = ExposureMask | KeyPressMask;
     
     lock_theme = load_theme();
-    color_bg = xft_color(lock_theme.bg);
-    color_fg = xft_color(lock_theme.fg);
-    color_indicator = xft_color(lock_theme.indicator);
+    color_bg = xft_color(lock_theme.bg_hex);
+    color_fg = xft_color(lock_theme.fg_hex);
+    color_indicator = xft_color(lock_theme.indicator_hex);
 
     swa.background_pixel = color_bg.pixel;
 
@@ -285,9 +294,11 @@ int main(void) {
                         }
                         auth_failed = 1;
                         pass_len = 0;
+                        memset(password, 0, sizeof(password));
                     }
                 } else if (ks == XK_Escape) {
                     pass_len = 0;
+                    memset(password, 0, sizeof(password));
                 } else if (ks == XK_BackSpace) {
                     if (pass_len > 0) pass_len--;
                 } else if (len > 0 && pass_len < MAX_PASS_LEN - 1) {

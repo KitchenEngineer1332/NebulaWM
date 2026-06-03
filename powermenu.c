@@ -2,6 +2,7 @@
 #include <X11/keysym.h>
 #include <X11/XKBlib.h>
 #include <X11/Xft/Xft.h>
+#include <X11/extensions/Xinerama.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,14 +56,14 @@ static XftColor get_xft_color(const char *hex) {
 }
 
 static void update_colors(Theme t) {
-    colors.bg       = get_xft_color(t.bg);
-    colors.input_bg = get_xft_color(t.input_bg);
-    colors.sel_bg   = get_xft_color(t.sel_bg);
-    colors.fg       = get_xft_color(t.fg);
-    colors.prompt   = get_xft_color(t.prompt);
-    colors.sel_fg   = get_xft_color(t.sel_fg);
-    colors.dim      = get_xft_color(t.dim);
-    colors.border   = get_xft_color(t.border);
+    colors.bg       = get_xft_color(t.bg_hex);
+    colors.input_bg = get_xft_color(t.input_bg_hex);
+    colors.sel_bg   = get_xft_color(t.sel_bg_hex);
+    colors.fg       = get_xft_color(t.fg_hex);
+    colors.prompt   = get_xft_color(t.prompt_hex);
+    colors.sel_fg   = get_xft_color(t.sel_fg_hex);
+    colors.dim      = get_xft_color(t.dim_hex);
+    colors.border   = get_xft_color(t.border_hex);
 }
 
 static void free_colors() {
@@ -133,6 +134,27 @@ int main(void) {
 
     int sw = DisplayWidth(dpy, screen);
     int sh = DisplayHeight(dpy, screen);
+    int wx = (sw - WIN_W) / 2;
+    int wy = (sh - WIN_H) / 2;
+
+    int n_screens;
+    XineramaScreenInfo *screens = XineramaQueryScreens(dpy, &n_screens);
+    if (screens) {
+        int root_x, root_y, win_x, win_y;
+        unsigned int mask;
+        Window root_ret, child_ret;
+        if (XQueryPointer(dpy, RootWindow(dpy, screen), &root_ret, &child_ret, &root_x, &root_y, &win_x, &win_y, &mask)) {
+            for (int i = 0; i < n_screens; i++) {
+                if (root_x >= screens[i].x_org && root_x < screens[i].x_org + screens[i].width &&
+                    root_y >= screens[i].y_org && root_y < screens[i].y_org + screens[i].height) {
+                    wx = screens[i].x_org + (screens[i].width - WIN_W) / 2;
+                    wy = screens[i].y_org + (screens[i].height - WIN_H) / 2;
+                    break;
+                }
+            }
+        }
+        XFree(screens);
+    }
 
     Theme t = load_theme();
     update_colors(t);
@@ -144,7 +166,7 @@ int main(void) {
     swa.border_pixel = colors.border.pixel;
 
     win = XCreateWindow(dpy, RootWindow(dpy, screen),
-                        (sw - WIN_W) / 2, (sh - WIN_H) / 2,
+                        wx, wy,
                         WIN_W, WIN_H, 2,
                         CopyFromParent, InputOutput, visual,
                         CWOverrideRedirect | CWEventMask | CWBackPixel | CWBorderPixel,
@@ -173,7 +195,8 @@ int main(void) {
     XEvent ev;
     int running = 1;
 
-    while (running && !XNextEvent(dpy, &ev)) {
+    while (running) {
+        XNextEvent(dpy, &ev);
         if (ev.type == Expose && ev.xexpose.count == 0) {
             draw();
         } else if (ev.type == KeyPress) {
@@ -188,8 +211,6 @@ int main(void) {
             } else if (ks == XK_Down || (ks == XK_j && (ev.xkey.state & ControlMask))) {
                 if (selected < option_count - 1) { selected++; draw(); }
             }
-        } else if (ev.type == FocusOut) {
-            running = 0;
         } else if (ev.type == MotionNotify) {
             int mx = ev.xmotion.x;
             int my = ev.xmotion.y;
@@ -206,9 +227,7 @@ int main(void) {
             int my = ev.xbutton.y;
             int list_y = PAD_Y + INPUT_H + 14;
             
-            if (mx < 0 || mx >= WIN_W || my < 0 || my >= WIN_H) {
-                running = 0;
-            } else if (mx >= PAD_X && mx <= WIN_W - PAD_X && my >= list_y && my < list_y + option_count * ITEM_H) {
+            if (mx >= PAD_X && mx <= WIN_W - PAD_X && my >= list_y && my < list_y + option_count * ITEM_H) {
                 int new_sel = (my - list_y) / ITEM_H;
                 selected = new_sel;
                 draw(); // Update visual before launching

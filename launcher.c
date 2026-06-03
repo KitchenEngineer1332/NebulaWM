@@ -3,6 +3,7 @@
 #include <X11/XKBlib.h>
 #include <X11/Xft/Xft.h>
 #include <X11/Xatom.h>
+#include <X11/extensions/Xinerama.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,6 +11,7 @@
 #include <dirent.h>
 #include <ctype.h>
 #include "theme.h"
+#include <locale.h>
 
 /* ── Appearance ─────────────────────────────────────────────── */
 #define MAX_APPS      512
@@ -57,13 +59,13 @@ static XftColor s_bg, s_input_bg, s_prompt, s_fg, s_dim, s_sel_bg, s_sel_fg;
 
 static void alloc_colors(void) {
     Theme t = load_theme();
-    XftColorAllocName(dpy, visual, cmap, t.bg, &s_bg);
-    XftColorAllocName(dpy, visual, cmap, t.input_bg, &s_input_bg);
-    XftColorAllocName(dpy, visual, cmap, t.prompt, &s_prompt);
-    XftColorAllocName(dpy, visual, cmap, t.fg, &s_fg);
-    XftColorAllocName(dpy, visual, cmap, t.dim, &s_dim);
-    XftColorAllocName(dpy, visual, cmap, t.sel_bg, &s_sel_bg);
-    XftColorAllocName(dpy, visual, cmap, t.sel_fg, &s_sel_fg);
+    XftColorAllocName(dpy, visual, cmap, t.bg_hex, &s_bg);
+    XftColorAllocName(dpy, visual, cmap, t.input_bg_hex, &s_input_bg);
+    XftColorAllocName(dpy, visual, cmap, t.prompt_hex, &s_prompt);
+    XftColorAllocName(dpy, visual, cmap, t.fg_hex, &s_fg);
+    XftColorAllocName(dpy, visual, cmap, t.dim_hex, &s_dim);
+    XftColorAllocName(dpy, visual, cmap, t.sel_bg_hex, &s_sel_bg);
+    XftColorAllocName(dpy, visual, cmap, t.sel_fg_hex, &s_sel_fg);
 }
 
 static void free_colors(void) {
@@ -132,8 +134,10 @@ static void scan_dir(const char *path) {
 
             if (strncmp(line, "Name=", 5) == 0 && name[0] == '\0') {
                 strncpy(name, line + 5, MAX_NAME - 1);
+                name[MAX_NAME - 1] = '\0';
             } else if (strncmp(line, "Exec=", 5) == 0 && exec[0] == '\0') {
                 strncpy(exec, line + 5, MAX_EXEC - 1);
+                exec[MAX_EXEC - 1] = '\0';
             } else if (strncmp(line, "NoDisplay=true", 14) == 0) {
                 no_display = 1;
             }
@@ -144,6 +148,8 @@ static void scan_dir(const char *path) {
             clean_exec(exec);
             strncpy(apps[app_count].name, name, MAX_NAME - 1);
             strncpy(apps[app_count].exec, exec, MAX_EXEC - 1);
+            apps[app_count].name[MAX_NAME - 1] = '\0';
+            apps[app_count].exec[MAX_EXEC - 1] = '\0';
             app_count++;
         }
     }
@@ -296,6 +302,27 @@ int main(void) {
 
     int sw = DisplayWidth(dpy, screen);
     int sh = DisplayHeight(dpy, screen);
+    int wx = (sw - WIN_W) / 2;
+    int wy = (sh - WIN_H) / 2;
+
+    int n_screens;
+    XineramaScreenInfo *screens = XineramaQueryScreens(dpy, &n_screens);
+    if (screens) {
+        int root_x, root_y, win_x, win_y;
+        unsigned int mask;
+        Window root_ret, child_ret;
+        if (XQueryPointer(dpy, RootWindow(dpy, screen), &root_ret, &child_ret, &root_x, &root_y, &win_x, &win_y, &mask)) {
+            for (int i = 0; i < n_screens; i++) {
+                if (root_x >= screens[i].x_org && root_x < screens[i].x_org + screens[i].width &&
+                    root_y >= screens[i].y_org && root_y < screens[i].y_org + screens[i].height) {
+                    wx = screens[i].x_org + (screens[i].width - WIN_W) / 2;
+                    wy = screens[i].y_org + (screens[i].height - WIN_H) / 2;
+                    break;
+                }
+            }
+        }
+        XFree(screens);
+    }
 
     /* create override-redirect window (no WM decorations) */
     XSetWindowAttributes swa;
@@ -307,12 +334,12 @@ int main(void) {
     unsigned long bg_pixel = 0;
     Theme t = load_theme();
     XftColor bg_c;
-    XftColorAllocName(dpy, visual, cmap, t.bg, &bg_c);
+    XftColorAllocName(dpy, visual, cmap, t.bg_hex, &bg_c);
     bg_pixel = bg_c.pixel;
     swa.background_pixel = bg_pixel;
 
     win = XCreateWindow(dpy, RootWindow(dpy, screen),
-                        (sw - WIN_W) / 2, (sh - WIN_H) / 2,
+                        wx, wy,
                         WIN_W, WIN_H, 1,
                         CopyFromParent, InputOutput, visual,
                         CWOverrideRedirect | CWEventMask
@@ -321,7 +348,7 @@ int main(void) {
 
     /* border colour */
     XftColor border_c;
-    XftColorAllocName(dpy, visual, cmap, t.border, &border_c);
+    XftColorAllocName(dpy, visual, cmap, t.border_hex, &border_c);
     XSetWindowBorder(dpy, win, border_c.pixel);
 
     /* Set window class hints */
@@ -358,7 +385,8 @@ int main(void) {
     XEvent ev;
     int running = 1;
 
-    while (running && !XNextEvent(dpy, &ev)) {
+    while (running) {
+        XNextEvent(dpy, &ev);
         if (ev.type == Expose && ev.xexpose.count == 0) {
             draw();
         } else if (ev.type == KeyPress) {
@@ -406,18 +434,6 @@ int main(void) {
             }
 
             if (redraw) draw();
-        } else if (ev.type == FocusOut) {
-            /* Only close on genuine focus loss, not spurious X11 events
-             * from grabs, popups, or pointer mode changes */
-            if (ev.xfocus.mode == NotifyNormal ||
-                ev.xfocus.mode == NotifyWhileGrabbed) {
-                /* Verify we truly lost focus by checking who has it now */
-                Window focused;
-                int revert;
-                XGetInputFocus(dpy, &focused, &revert);
-                if (focused != win)
-                    running = 0;
-            }
         }
     }
 

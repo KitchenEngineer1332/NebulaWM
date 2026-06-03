@@ -1,12 +1,13 @@
 CC = gcc
-CFLAGS = -Wall -Wextra
-LIBS = -lX11 -lXinerama
-XFT_CFLAGS = $(shell pkg-config --cflags xft)
-XFT_LIBS = $(shell pkg-config --libs xft) -lX11 -lXinerama
+CFLAGS = -O3 -march=native -flto -Wall -Wextra
+LDFLAGS = -Wl,-O1,--sort-common,--as-needed -s
+LIBS = -lX11 -lXinerama -lm $(IMLIB2_LIBS)
+XFT_CFLAGS = $(shell pkg-config --cflags xft) $(IMLIB2_CFLAGS)
+XFT_LIBS = $(shell pkg-config --libs xft) -lX11 -lXinerama -lm $(IMLIB2_LIBS)
 IMLIB2_CFLAGS = $(shell pkg-config --cflags imlib2)
 IMLIB2_LIBS = $(shell pkg-config --libs imlib2)
 
-SRC = main.c config.c
+SRC = main.c config.c theme.c
 OBJ = $(SRC:.c=.o)
 EXEC = nebulawm
 LAUNCHER = nebula-launcher
@@ -24,25 +25,25 @@ XSESSIONSDIR ?= /usr/share/xsessions
 all: $(EXEC) $(LAUNCHER) $(POWERMENU) $(LOCKSCREEN) $(BAR) $(STARLIGHT) $(COMPOSITOR)
 
 $(EXEC): $(OBJ)
-	$(CC) $(OBJ) $(LIBS) $(XFT_LIBS) -o $(EXEC)
+	$(CC) $(OBJ) $(CFLAGS) $(LDFLAGS) $(LIBS) $(XFT_LIBS) -o $(EXEC)
 
-$(LAUNCHER): launcher.c
-	$(CC) $(CFLAGS) $(XFT_CFLAGS) launcher.c $(XFT_LIBS) -o $(LAUNCHER)
+$(LAUNCHER): launcher.c theme.o
+	$(CC) $(CFLAGS) $(LDFLAGS) $(XFT_CFLAGS) launcher.c theme.o $(XFT_LIBS) -o $(LAUNCHER)
 
-$(POWERMENU): powermenu.c
-	$(CC) $(CFLAGS) $(XFT_CFLAGS) powermenu.c $(XFT_LIBS) -o $(POWERMENU)
+$(POWERMENU): powermenu.c theme.o
+	$(CC) $(CFLAGS) $(LDFLAGS) $(XFT_CFLAGS) powermenu.c theme.o $(XFT_LIBS) -o $(POWERMENU)
 
-$(LOCKSCREEN): lockscreen.c
-	$(CC) $(CFLAGS) $(XFT_CFLAGS) $(IMLIB2_CFLAGS) lockscreen.c $(XFT_LIBS) $(IMLIB2_LIBS) -lpam -o $(LOCKSCREEN)
+$(LOCKSCREEN): lockscreen.c theme.o
+	$(CC) $(CFLAGS) $(LDFLAGS) $(XFT_CFLAGS) $(IMLIB2_CFLAGS) lockscreen.c theme.o $(XFT_LIBS) $(IMLIB2_LIBS) -lpam -o $(LOCKSCREEN)
 
-$(BAR): bar.c
-	$(CC) $(CFLAGS) $(XFT_CFLAGS) bar.c $(XFT_LIBS) -o $(BAR)
+$(BAR): bar.c theme.o
+	$(CC) $(CFLAGS) $(LDFLAGS) $(XFT_CFLAGS) bar.c theme.o $(XFT_LIBS) -lXrender -lfontconfig -o $(BAR)
 
-$(STARLIGHT): starlight.c
-	$(CC) $(CFLAGS) $(XFT_CFLAGS) starlight.c $(XFT_LIBS) -lutil -o $(STARLIGHT)
+$(STARLIGHT): starlight.c theme.o
+	$(CC) $(CFLAGS) $(LDFLAGS) $(XFT_CFLAGS) starlight.c theme.o $(XFT_LIBS) -lutil -o $(STARLIGHT)
 
 $(COMPOSITOR): compositor.c
-	$(CC) $(CFLAGS) compositor.c -o $(COMPOSITOR) $(LIBS) $(COMP_LIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) compositor.c -o $(COMPOSITOR) $(LIBS) $(COMP_LIBS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) $(XFT_CFLAGS) -c $< -o $@
