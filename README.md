@@ -51,7 +51,7 @@ sudo apt install build-essential libx11-dev libxinerama-dev libxft-dev libimlib2
 ### Method 1: Automatic Installation (Recommended)
 Simply run the included installation script, which will detect your distribution, install dependencies, and build the project:
 ```bash
-git clone https://github.com/yourusername/NebulaWM.git
+git clone https://github.com/KitchenEngineer1332/NebulaWM.git
 cd NebulaWM
 chmod +x install.sh
 ./install.sh
@@ -62,7 +62,7 @@ To install NebulaWM manually, follow these steps:
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/yourusername/NebulaWM.git
+   git clone https://github.com/KitchenEngineer1332/NebulaWM.git
    cd NebulaWM
    ```
 
